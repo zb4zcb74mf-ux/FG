@@ -1,0 +1,41 @@
+import os
+import discord
+from discord.ext import commands
+from discord.app_commands import describe
+
+intents = discord.Intents.default()
+intents.message_content = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+@bot.event
+async def on_ready():
+    print(f'Logged in as {bot.user.name}')
+    try:
+        synced = await bot.tree.sync()
+        print(f"تمت مزامنة الأوامر بنجاح")
+    except Exception as e:
+        print(e)
+
+# أمر إرسال إمبد مخصص بالكتابة اليدوية والصورة مع خط جانبي أسود
+@bot.tree.command(name="embed", description="إرسال إمبد مخصص مع نصك وصورتك بخط جانبي أسود")
+@describe(
+    text="اكتب الكلام الذي تريده داخل الإمبد",
+    image="اختر الصورة التي تظهر في أسفل الإمبد"
+)
+async def custom_embed(interaction: discord.Interaction, text: str, image: discord.Attachment):
+    # تحويل رموز السطر الجديد \n إلى أسطر حقيقية مرتبة
+    formatted_text = text.replace("\\n", "\n")
+
+    embed = discord.Embed(
+        description=formatted_text,
+        color=0x000000  # الخط الجانبي أسود فخم
+    )
+    embed.set_image(url=image.url)
+
+    # إرسال الإمبد في الشات وحذف رد الأمر المؤقت
+    await interaction.channel.send(embed=embed)
+    await interaction.response.send_message("تم إرسال الإمبد بنجاح!", ephemeral=True)
+
+token = os.getenv("DDD")
+bot.run(token)
