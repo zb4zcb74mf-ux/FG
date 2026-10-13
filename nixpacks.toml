@@ -1,0 +1,11 @@
+[phases.setup]
+nixPkgs = ["python311", "ffmpeg"]
+
+[phases.install]
+cmds = ["pip install discord.py yt-dlp pynacl"]
+
+[phases.build]
+cmds = []
+
+[phases.start]
+cmd = "python main.py"
