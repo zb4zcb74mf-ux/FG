@@ -1,0 +1,3 @@
+discord.py==2.3.2
+yt-dlp
+PyNaCl==1.5.0
