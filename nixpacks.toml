@@ -1,0 +1,11 @@
+[phases.setup]
+nixPkgs = ["python311", "ffmpeg", "libffi", "libsodium"]
+
+[phases.install]
+cmds = ["pip install --upgrade pip", "pip install discord.py yt-dlp pynacl"]
+
+[phases.build]
+cmds = []
+
+[phases.start]
+cmd = "python main.py"
