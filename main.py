@@ -26,25 +26,13 @@ YTDL_OPTIONS = {
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
-    "default_search": "ytsearch",
+    "default_search": "scsearch",
     "source_address": "0.0.0.0",
-    "geo_bypass": True,
-    "nocheckcertificate": True,
-    "ignoreerrors": False,
-    "logtostderr": False,
-    "extractor_args": {
-        "youtube": {
-            "player_client": ["android", "web"],
-        }
-    },
-    "http_headers": {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    },
 }
 
 FFMPEG_OPTIONS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -vn",
-    "options": "-af volume=0.5",
+    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+    "options": "-vn -af volume=0.5",
 }
 
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
@@ -64,7 +52,7 @@ async def extract_info(url: str) -> dict[str, Any] | None:
 
 
 async def find_track(search: str) -> dict[str, str]:
-    query = search if search.startswith("http") else f"ytsearch:{search}"
+    query = search if search.startswith("http") else f"scsearch:{search}"
     data = await extract_info(query)
     if not data:
         raise ValueError("لم أجد نتيجة.")
@@ -112,7 +100,7 @@ async def play_next(guild: discord.Guild) -> None:
             track, requester_channel = queue.pop(0)
             try:
                 stream_url = track.get("url")
-                if not stream_url or "googlevideo.com" not in stream_url:
+                if not stream_url:
                     stream_data = await extract_info(track["webpage"])
                     if stream_data and stream_data.get("entries"):
                         stream_data = stream_data["entries"][0]
@@ -222,8 +210,8 @@ async def join_voice(interaction: discord.Interaction) -> None:
     await interaction.followup.send(f"✅ دخلت الروم الصوتي: **{channel.name}**", ephemeral=True)
 
 
-@bot.tree.command(name="شغل", description="تشغيل أغنية بالاسم أو الرابط")
-@app_commands.describe(search="اسم الأغنية أو الرابط")
+@bot.tree.command(name="شغل", description="تشغيل أغنية من ساوندكلاود بالاسم أو الرابط")
+@app_commands.describe(search="اسم الأغنية أو رابط ساوندكلاود")
 @app_commands.guild_only()
 async def play_song(interaction: discord.Interaction, search: str) -> None:
     if not interaction.user.voice or not interaction.user.voice.channel:
@@ -251,7 +239,7 @@ async def play_song(interaction: discord.Interaction, search: str) -> None:
         track = await find_track(search)
     except Exception as exc:
         logger.warning("Track lookup failed for %r: %s", search, exc)
-        await interaction.followup.send("ما لقيت الأغنية أو تعذر جلبها.", ephemeral=True)
+        await interaction.followup.send("ما لقيت الأغنية في ساوندكلاود.", ephemeral=True)
         return
 
     queues.setdefault(interaction.guild.id, []).append((track, interaction.channel))
