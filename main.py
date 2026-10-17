@@ -1,0 +1,4828 @@
+import io
+import os
+import re
+import json
+import time
+import random
+import asyncio
+import platform
+import datetime
+import traceback
+from typing import Literal, Optional
+
+import discord
+from discord.ext import commands, tasks
+from dotenv import load_dotenv
+
+# مكتبة Pillow لازمة لتصميم الافتار (بنر فوق + افتار دائري تحت) — إذا ناقصة نثبتها تلقائياً
+try:
+    import PIL  # noqa: F401
+except ImportError:
+    import subprocess
+    import sys
+    for _extra in ([], ["--break-system-packages"], ["--user"]):
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "Pillow", *_extra])
+            import PIL  # noqa: F401
+            print("[setup] تم تثبيت Pillow تلقائياً")
+            break
+        except Exception as _err:
+            print(f"[setup] فشل تثبيت Pillow ({_extra}): {_err}")
+
+load_dotenv()
+TOKEN = os.getenv("DISCORD_TOKEN")
+PREFIX = os.getenv("PREFIX", "!")
+BOT_NAME = "Taqat"
+COLOR = 0x2B8CFF
+DATA_FILE = "data.json"
+IMG_DIR = "images"
+
+# ألوان موحّدة لرسائل الأوامر
+C_OK = 0x3DDC84
+C_ERR = 0xFF5555
+C_WARN = 0xFFAA00
+C_INFO = COLOR
+
+intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True
+
+bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
+START_TIME = datetime.datetime.now(datetime.timezone.utc)
+
+STYLES = {
+    "gray": discord.ButtonStyle.secondary,
+    "blue": discord.ButtonStyle.primary,
+    "green": discord.ButtonStyle.success,
+    "red": discord.ButtonStyle.danger,
+}
+
+# أزرار لوحة التحكم داخل التذكرة (الافتراضي)
+DEFAULT_BTN = {
+    "claim": {"label": "استلام", "emoji": "🙋", "style": "gray"},
+    "close": {"label": "إغلاق", "emoji": "❌", "style": "gray"},
+    "more":  {"label": "إجراءات أخرى", "emoji": "⚙️", "style": "gray"},
+}
+
+# الرسالة الافتراضية داخل التذكرة (قابلة للتخصيص بالكامل)
+DEFAULT_INSIDE = (
+    "مرحبا بك في الدعم الفني ، يرجى عدم تجاهل التذكرة\n\n"
+    "👤 **صاحب التذكرة**\n{user}\n\n"
+    "📅 **التاريخ**\n{date}\n\n"
+    "📝 **سبب التذكرة**\n{reason}"
+)
+
+PRIORITIES = {
+    "low": ("🟢", "منخفضة"),
+    "normal": ("🟡", "عادية"),
+    "high": ("🟠", "عالية"),
+    "urgent": ("🔴", "عاجلة"),
+}
+
+URL_RE = re.compile(r"(https?://|discord\.gg/|discord\.com/invite/|www\.)\S+", re.I)
+
+# ---------------------------------------------------------------- التخزين
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        return {}
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_data():
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(DATA, f, ensure_ascii=False, indent=2)
+
+DATA = load_data()
+
+WELCOME_DESC = (
+    "**Username :** {username}\n"
+    "**Invited By :** {inviter}\n"
+    "**You're Member :** #{number}"
+)
+
+def conf(guild_id: int) -> dict:
+    g = DATA.setdefault(str(guild_id), {})
+    g.setdefault("autorole", None)
+    g.setdefault("warns", {})
+    g.setdefault("tickets", {})
+    g.setdefault("points", {})       # نقاط الدعم: {staff_id: {points, closed, rating_sum, rating_count}}
+    ar = g.setdefault("autoreply", {})
+    ar.setdefault("enabled", True)
+    ar.setdefault("list", {})        # {مفتاح_مطبّع: {trigger, reply, mode}}
+
+    w = g.setdefault("welcome", {})
+    w.setdefault("channel", None)
+    w.setdefault("content", "{user}")
+    w.setdefault("author", "{name}")
+    w.setdefault("desc", "Welcome To {server}")
+    w.setdefault("footer", "{count}")
+    w.setdefault("color", "E8352A")
+    w.setdefault("thumb", True)
+    w.setdefault("image", None)
+    w.setdefault("title", "Welcome")
+    w.setdefault("banner", None)         # الشريط السفلي (صورة تحت البطاقة)
+    w.setdefault("style", "modern")      # modern = التصميم الجديد | classic = الإيمبد القديم
+    if w.get("_v") != 2:                 # ترقية الإعدادات الافتراضية القديمة فقط (المخصص ما يتغير)
+        if w["desc"] == "Welcome To {server}":
+            w["desc"] = WELCOME_DESC
+        if w["footer"] == "{count}":
+            w["footer"] = "{date}"
+        w["_v"] = 2
+
+    lv = g.setdefault("leave", {})
+    lv.setdefault("channel", None)
+    lv.setdefault("msg", "👋 {name} غادر السيرفر")
+
+    t = g.setdefault("ticket", {})
+    t.setdefault("log_channel", None)
+    t.setdefault("counter", 0)
+    t.setdefault("type_counter", 0)
+    t.setdefault("types", {})
+    t.setdefault("max", 1)            # أقصى عدد تذاكر مفتوحة للعضو الواحد
+    t.setdefault("blacklist", [])     # ممنوعين من فتح التذاكر
+    t.setdefault("autoclose", 0)      # إغلاق تلقائي بعد X ساعات بدون نشاط (0 = معطل)
+    t.setdefault("point_value", 1)    # نقاط المستلم عند إغلاق كل تذكرة
+
+    p = g.setdefault("panel", {})
+    p.setdefault("channel_id", None)
+    p.setdefault("message_id", None)
+    p.setdefault("title", "🎫 نظام التذاكر")
+    p.setdefault("desc", (
+        "• يرجى الالتزام الكامل بالقوانين داخل التذكرة.\n"
+        "• جميع الرسائل محفوظة دائمًا لضمان النظام.\n"
+        "• ممنوع تمامًا فتح تذكرة بلا سبب واضح.\n"
+        "• في حال عدم الرد لمدة 6 ساعات يتم إغلاق التذكرة.\n"
+        "• يرجى كتابة موضوعك مباشرة عند فتح التذكرة."))
+    p.setdefault("footer", "سيتم فتح قناة خاصة للتواصل مع فريق الدعم")
+    p.setdefault("color", "2B2D31")
+    p.setdefault("image", None)
+    p.setdefault("ticketmsg", "اكتب مشكلتك أو طلبك وراح يرد عليك الفريق قريباً.")
+
+    # لوحة التحكم داخل التذكرة
+    ins = g.setdefault("inside", {})
+    ins.setdefault("content", "{user} {support}")
+    ins.setdefault("author", "Staff")
+    ins.setdefault("author_icon", None)
+    ins.setdefault("desc", DEFAULT_INSIDE)
+    ins.setdefault("footer", "يمكنك إغلاق التذكرة أو استلامها أو استخدام الإجراءات الأخرى")
+    ins.setdefault("color", "2B2D31")
+    ins.setdefault("thumb", False)
+    ins.setdefault("image", None)
+    ins.setdefault("ask_reason", True)
+    ins.setdefault("btn", {k: dict(v) for k, v in DEFAULT_BTN.items()})
+
+    r = g.setdefault("rules", {})
+    r.setdefault("channel", None)
+    r.setdefault("action", "ban")
+    r.setdefault("exempt", [])
+
+    a = g.setdefault("automod", {})
+    a.setdefault("antilink", False)
+    a.setdefault("badwords", [])
+
+    g.setdefault("modlog", {}).setdefault("channel", None)
+
+    # --- ميزات جديدة
+    sc = g.setdefault("shortcuts", {})
+    sc.setdefault("enabled", True)                 # الاختصارات العربية بدون بادئة
+
+    ws = g.setdefault("warnsys", {})
+    ws.setdefault("threshold", 0)                  # عقوبة تلقائية كل X تحذيرات (0 = معطل)
+    ws.setdefault("action", "mute")
+    ws.setdefault("minutes", 60)
+
+    cs = g.setdefault("cases", {})
+    cs.setdefault("counter", 0)
+    cs.setdefault("list", [])
+
+    # --- الأذكار / تيك توك / التحدث باسم البوت
+    az = g.setdefault("azkar", {})
+    az.setdefault("channel", None)
+    az.setdefault("hours", 0)
+    az.setdefault("last_dua", 0)
+    az.setdefault("morning", {"on": True, "time": "05:30"})
+    az.setdefault("evening", {"on": True, "time": "17:30"})
+    az.setdefault("last", {})
+    az.setdefault("custom", [])
+    tk = g.setdefault("tiktok", {})
+    tk.setdefault("user", None)
+    tk.setdefault("channel", None)
+    tk.setdefault("role", None)
+    tk.setdefault("seen", [])
+    rl = g.setdefault("relay", {})
+    rl.setdefault("source", None)
+    rl.setdefault("target", None)
+    tvc = g.setdefault("tempvoice", {})
+    tvc.setdefault("hub", None)
+    tvc.setdefault("category", None)
+    tvc.setdefault("name", "🔊 {name}")
+    tvc.setdefault("rooms", {})
+    tvc.setdefault("emoji", {})        # إيموجي مخصصة للأزرار {action: emoji}
+    tvc.setdefault("image", None)      # الصورة اللي بنص اللوحة
+    tvc.setdefault("title", "لوحة التحكم بالرومات المؤقتة")
+    tvc.setdefault("desc", "تقدر تستخدم هذه اللوحة لإدارة رومك الصوتي المؤقت.\nادخل روم **➕ أنشئ رومك** وبيتسوّى لك روم خاص فيك.")
+    tvc.setdefault("footer", "تقدر تستخدم هذه اللوحة بالضغط على الأزرار أدناه")
+
+    # --- نظام التقديم
+    ap = g.setdefault("apply", {})
+    ap.setdefault("types", {})
+    ap.setdefault("next", 1)
+    ap.setdefault("subs", {})
+    ap.setdefault("nsub", 0)
+    # --- نظام الافتارات
+    avt = g.setdefault("avt", {})
+    avt.setdefault("servers", {"Respect": None, "MT": None})
+    avt.setdefault("channel", None)
+    avt.setdefault("title", "افتارات الشخصيات")
+    avt.setdefault("desc", "اختر السيرفر من الأزرار تحت، وارفع افتار شخصيتك (والبنر اختياري) وبينزل في روم الافتارات.")
+    avt.setdefault("top", None)
+    avt.setdefault("bottom", None)
+    avt.setdefault("color", "C9A66B")
+    avt.setdefault("status", "dnd")
+    avt.setdefault("posts", {})        # {message_id: {owner, name, avatar, banner}} الصور الأصلية للتحميل
+    return g
+
+# ---------------------------------------------------------------- أدوات مساعدة
+def embed(title=None, desc=None, color=COLOR):
+    e = discord.Embed(title=title, description=desc, color=color)
+    e.set_footer(text=BOT_NAME)
+    return e
+
+def parse_color(s) -> int:
+    try:
+        return int(str(s).lstrip("#"), 16)
+    except ValueError:
+        return COLOR
+
+def valid_color(s: str) -> bool:
+    return bool(re.fullmatch(r"#?[0-9a-fA-F]{6}", s.strip()))
+
+def nl(text: str) -> str:
+    """يحول \\n المكتوبة إلى سطر جديد (للأوامر السلاش)."""
+    return text.replace("\\n", "\n")
+
+def fmt(text: str, member: discord.Member, extra: dict | None = None) -> str:
+    out = ((text or "")
+           .replace("{user}", member.mention)
+           .replace("{name}", member.name)
+           .replace("{server}", member.guild.name)
+           .replace("{count}", str(member.guild.member_count)))
+    for k, v in (extra or {}).items():
+        out = out.replace(k, v)
+    return out
+
+async def store_image(guild_id: int, kind: str, attachment, url):
+    """يحفظ الصورة: مرفق (ينحفظ محلياً) أو رابط."""
+    if attachment is not None:
+        if not (attachment.content_type or "").startswith("image/"):
+            raise ValueError("المرفق لازم يكون صورة.")
+        os.makedirs(IMG_DIR, exist_ok=True)
+        ext = os.path.splitext(attachment.filename)[1] or ".png"
+        path = f"{IMG_DIR}/{guild_id}_{kind}{ext}"
+        await attachment.save(path)
+        return {"path": path}
+    if url:
+        if not url.startswith("http"):
+            raise ValueError("الرابط لازم يبدأ بـ http.")
+        return {"url": url}
+    raise ValueError("أرفق صورة أو حط رابط.")
+
+def apply_image(e: discord.Embed, img, name: str):
+    """يضيف الصورة السفلية للإيمبد، ويرجع File إذا كانت محلية."""
+    if not img:
+        return None
+    if img.get("path") and os.path.exists(img["path"]):
+        fname = f"{name}{os.path.splitext(img['path'])[1]}"
+        e.set_image(url=f"attachment://{fname}")
+        return discord.File(img["path"], filename=fname)
+    if img.get("url"):
+        e.set_image(url=img["url"])
+    return None
+
+def can_act(ctx, member: discord.Member) -> str | None:
+    if member == ctx.author:
+        return "ما تقدر تنفذ هذا على نفسك."
+    if member == ctx.guild.owner:
+        return "ما تقدر على مالك السيرفر."
+    if member.top_role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
+        return "رتبة العضو أعلى منك أو تساويك."
+    if member.top_role >= ctx.guild.me.top_role:
+        return "رتبة العضو أعلى من رتبة البوت."
+    return None
+
+async def modlog(guild: discord.Guild, e: discord.Embed):
+    cid = conf(guild.id)["modlog"]["channel"]
+    ch = guild.get_channel(cid) if cid else None
+    if ch:
+        try:
+            await ch.send(embed=e)
+        except discord.HTTPException:
+            pass
+
+# ---------------------------------------------------------------- التصميم الموحّد للأوامر
+def fancy(title=None, desc=None, color=COLOR, footer=None) -> discord.Embed:
+    e = discord.Embed(title=title, description=desc, color=color,
+                      timestamp=discord.utils.utcnow())
+    e.set_footer(text=footer or BOT_NAME)
+    return e
+
+def ok_e(title, desc=None):
+    return fancy(f"✅ {title}", desc, C_OK)
+
+def err_e(desc, title="تعذّر تنفيذ الأمر"):
+    return fancy(f"❌ {title}", desc, C_ERR)
+
+def warn_e(title, desc=None):
+    return fancy(f"⚠️ {title}", desc, C_WARN)
+
+def info_e(title, desc=None):
+    return fancy(title, desc, C_INFO)
+
+async def send_err(ctx, desc, title="تعذّر تنفيذ الأمر"):
+    await ctx.send(embed=err_e(desc, title), ephemeral=True)
+
+def add_case(guild_id: int, action: str, target_id: int, mod_id: int, reason: str) -> int:
+    cs = conf(guild_id)["cases"]
+    cs["counter"] += 1
+    cs["list"].append({"id": cs["counter"], "action": action, "target": target_id, "mod": mod_id,
+                       "reason": reason,
+                       "time": datetime.datetime.now(datetime.timezone.utc).isoformat()})
+    del cs["list"][:-1000]
+    save_data()
+    return cs["counter"]
+
+def mod_embed(emoji, title, target, mod, reason, color, case=None, extra=None) -> discord.Embed:
+    e = fancy(f"{emoji} {title}", color=color,
+              footer=f"{BOT_NAME} • حالة #{case}" if case else None)
+    e.set_thumbnail(url=target.display_avatar.url)
+    e.add_field(name="👤 العضو", value=f"{target.mention}\n`{target.id}`")
+    e.add_field(name="🛡️ المسؤول", value=f"{mod.mention}\n`{mod.id}`")
+    for n, v in (extra or []):
+        e.add_field(name=n, value=v)
+    e.add_field(name="📝 السبب", value=(reason or "بدون سبب")[:1000], inline=False)
+    return e
+
+async def finish_mod(ctx, emoji, title, target, reason, color, extra=None) -> int:
+    """يسجل الحالة، يرسل النتيجة للشات، وينسخها للوق السيرفر."""
+    case = add_case(ctx.guild.id, title, target.id, ctx.author.id, reason)
+    e = mod_embed(emoji, title, target, ctx.author, reason, color, case, extra)
+    await ctx.send(embed=e)
+    cid = conf(ctx.guild.id)["modlog"]["channel"]
+    if cid and cid != ctx.channel.id:
+        await modlog(ctx.guild, e)
+    return case
+
+async def notify(target, guild: discord.Guild, emoji, title, reason, color, extra=None):
+    """رسالة خاصة للعضو يعرف فيها وش صار."""
+    e = fancy(f"{emoji} {title}", color=color)
+    if guild.icon:
+        e.set_thumbnail(url=guild.icon.url)
+    e.add_field(name="🏠 السيرفر", value=guild.name)
+    for n, v in (extra or []):
+        e.add_field(name=n, value=v)
+    e.add_field(name="📝 السبب", value=(reason or "بدون سبب")[:1000], inline=False)
+    try:
+        await target.send(embed=e)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+DUR_RE = re.compile(r"^(\d+)\s*(m|h|d|د|س|ي)?$", re.I)
+DUR_UNITS = {"m": 1, "h": 60, "d": 1440, "د": 1, "س": 60, "ي": 1440}
+
+def parse_duration(s: str) -> int | None:
+    """30 / 30m / 2h / 1d / 30د / 2س / 1ي  ->  دقائق"""
+    m = DUR_RE.match((s or "").strip())
+    if not m:
+        return None
+    return int(m[1]) * DUR_UNITS[(m[2] or "m").lower()]
+
+def human_minutes(mins: int) -> str:
+    d, r = divmod(mins, 1440)
+    h, m = divmod(r, 60)
+    parts = []
+    if d:
+        parts.append(f"{d} يوم")
+    if h:
+        parts.append(f"{h} ساعة")
+    if m:
+        parts.append(f"{m} دقيقة")
+    return " و ".join(parts) or "0 دقيقة"
+
+class ConfirmView(discord.ui.View):
+    """تأكيد للأوامر الخطيرة."""
+    def __init__(self, author_id: int):
+        super().__init__(timeout=30)
+        self.author_id, self.value = author_id, None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ هذا الزر مو لك.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="تأكيد", emoji="✅", style=discord.ButtonStyle.danger)
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.value = True
+        await interaction.response.defer()
+        self.stop()
+
+    @discord.ui.button(label="إلغاء", emoji="✖️", style=discord.ButtonStyle.secondary)
+    async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.value = False
+        await interaction.response.defer()
+        self.stop()
+
+# ---------------------------------------------------------------- الأحداث
+@bot.event
+async def on_ready():
+    await bot.change_presence(activity=discord.Game(name=f"{PREFIX}help | {BOT_NAME}"))
+    print(f"✅ {bot.user} شغّال على {len(bot.guilds)} سيرفر")
+
+@bot.event
+async def setup_hook():
+    bot.add_dynamic_items(TicketButton)
+    bot.add_view(TicketControls())
+    bot.add_view(TVPanel())
+    if not autoclose_loop.is_running():
+        autoclose_loop.start()
+    if not scheduled_close_loop.is_running():
+        scheduled_close_loop.start()
+    if not azkar_loop.is_running():
+        azkar_loop.start()
+    if not tiktok_loop.is_running():
+        tiktok_loop.start()
+    await bot.tree.sync()
+
+def welcome_vars(member: discord.Member, inviter_id, classic: bool = False) -> dict:
+    """متغيرات الترحيب الإضافية: {username} {inviter} {inviter_name} {number} {date}"""
+    now = discord.utils.utcnow()
+    inv = member.guild.get_member(inviter_id) if inviter_id else None
+    return {
+        "{username}": member.name,
+        "{inviter}": f"<@{inviter_id}>" if inviter_id else "غير معروف",
+        "{inviter_name}": inv.name if inv else "غير معروف",
+        "{number}": str(member.guild.member_count),
+        "{date}": now.strftime("%A, %B %d, %Y at %I:%M %p") if classic
+                  else f"<t:{int(now.timestamp())}:F>",
+    }
+
+def build_welcome(member: discord.Member, inviter_id=None):
+    """الإيمبد الكلاسيكي (التصميم القديم) — يُستخدم عند welcomestyle classic."""
+    w = conf(member.guild.id)["welcome"]
+    v = welcome_vars(member, inviter_id, classic=True)
+    e = discord.Embed(description=fmt(w["desc"], member, v), color=parse_color(w["color"]))
+    e.set_author(name=fmt(w["author"], member, v), icon_url=member.display_avatar.url)
+    if w["thumb"]:
+        e.set_thumbnail(url=member.display_avatar.url)
+    if w["footer"]:
+        e.set_footer(text=fmt(w["footer"], member, v))
+    f = apply_image(e, w["image"], "welcome")
+    return fmt(w["content"], member, v) or None, e, f
+
+def _media(img, name: str):
+    """(رابط للعرض, ملف محلي أو None) لصورة محفوظة."""
+    if not img:
+        return None, None
+    if img.get("path") and os.path.exists(img["path"]):
+        fn = f"{name}{os.path.splitext(img['path'])[1]}"
+        return f"attachment://{fn}", discord.File(img["path"], filename=fn)
+    if img.get("url"):
+        return img["url"], None
+    return None, None
+
+def welcome_modern(member: discord.Member, inviter_id=None) -> dict:
+    """بطاقة الترحيب الجديدة: صورة فوق + نص + صورة العضو على الجنب + سطر تاريخ + شريط سفلي."""
+    ui = discord.ui
+    w = conf(member.guild.id)["welcome"]
+    v = welcome_vars(member, inviter_id)
+    ft = lambda s: fmt(s, member, v)
+    top, f1 = _media(w["image"], "welcome_top")
+    banner, f2 = _media(w.get("banner"), "welcome_banner")
+
+    parts = []
+    if w.get("title"):
+        parts.append(f"# {ft(w['title'])}")
+    if w["desc"]:
+        parts.append(ft(w["desc"]))
+    text = "\n".join(parts) or "\u200b"
+
+    items = []
+    if top:
+        items += [ui.MediaGallery(discord.MediaGalleryItem(top)), ui.Separator()]
+    if w["thumb"]:
+        items.append(ui.Section(ui.TextDisplay(text), accessory=ui.Thumbnail(member.display_avatar.url)))
+    else:
+        items.append(ui.TextDisplay(text))
+    if w["footer"]:
+        items += [ui.Separator(), ui.TextDisplay(ft(w["footer"]))]
+
+    view = ui.LayoutView(timeout=None)
+    view.add_item(ui.Container(*items, accent_colour=discord.Colour(parse_color(w["color"]))))
+    if banner:
+        view.add_item(ui.MediaGallery(discord.MediaGalleryItem(banner)))
+    return {"view": view, "files": [f for f in (f1, f2) if f],
+            "allowed_mentions": discord.AllowedMentions.none()}
+
+def welcome_payload(member: discord.Member, inviter_id=None) -> dict:
+    w = conf(member.guild.id)["welcome"]
+    if w.get("style", "modern") == "modern" and hasattr(discord.ui, "LayoutView"):
+        try:
+            return welcome_modern(member, inviter_id)
+        except Exception:
+            traceback.print_exc()
+    content, e, f = build_welcome(member, inviter_id)
+    return {"content": content, "embed": e, "file": f}
+
+async def send_welcome(dest, member: discord.Member, inviter_id=None):
+    try:
+        return await dest.send(**welcome_payload(member, inviter_id))
+    except discord.Forbidden:
+        return None
+    except discord.HTTPException:
+        content, e, f = build_welcome(member, inviter_id)
+        try:
+            return await dest.send(content=content, embed=e, file=f)
+        except discord.HTTPException:
+            return None
+
+# ---- تتبع الدعوات (لمعرفة من دعا العضو: Invited By)
+INVITES: dict[int, dict[str, tuple]] = {}   # guild -> code -> (uses, inviter_id, max_uses)
+
+async def cache_invites(guild: discord.Guild):
+    try:
+        INVITES[guild.id] = {i.code: (i.uses or 0, i.inviter.id if i.inviter else None, i.max_uses or 0)
+                             for i in await guild.invites()}
+    except discord.HTTPException:
+        pass
+
+async def detect_inviter(guild: discord.Guild):
+    old = INVITES.get(guild.id)
+    try:
+        invs = await guild.invites()
+    except discord.HTTPException:
+        return None
+    new = {i.code: (i.uses or 0, i.inviter.id if i.inviter else None, i.max_uses or 0) for i in invs}
+    INVITES[guild.id] = new
+    if old is None:
+        return None
+    for code, (uses, inv, _) in new.items():
+        if uses > old.get(code, (0,))[0]:
+            return inv
+    # دعوة محدودة الاستخدام انحذفت بعد آخر استخدام
+    gone = [(c, t) for c, t in old.items() if c not in new and t[2] and t[0] + 1 == t[2]]
+    return gone[0][1][1] if len(gone) == 1 else None
+
+@bot.listen("on_ready")
+async def _invites_ready():
+    for g in bot.guilds:
+        await cache_invites(g)
+
+@bot.listen("on_guild_join")
+async def _invites_guild_join(guild: discord.Guild):
+    await cache_invites(guild)
+
+@bot.listen("on_invite_create")
+async def _invites_create(invite: discord.Invite):
+    if invite.guild:
+        INVITES.setdefault(invite.guild.id, {})[invite.code] = (
+            invite.uses or 0, invite.inviter.id if invite.inviter else None, invite.max_uses or 0)
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    c = conf(member.guild.id)
+    if c["autorole"]:
+        role = member.guild.get_role(c["autorole"])
+        if role:
+            try:
+                await member.add_roles(role, reason="Auto role")
+            except discord.Forbidden:
+                pass
+    inviter_id = await detect_inviter(member.guild)
+    cid = c["welcome"]["channel"]
+    ch = member.guild.get_channel(cid) if cid else None
+    if ch:
+        await send_welcome(ch, member, inviter_id)
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    lv = conf(member.guild.id)["leave"]
+    ch = member.guild.get_channel(lv["channel"]) if lv["channel"] else None
+    if ch:
+        text = fmt(lv["msg"], member).replace(member.mention, str(member))
+        await ch.send(embed=embed(None, text, 0xFF5555))
+
+PERM_AR = {
+    "administrator": "مدير (Administrator)",
+    "kick_members": "طرد الأعضاء",
+    "ban_members": "حظر الأعضاء",
+    "moderate_members": "إدارة الأعضاء (Timeout)",
+    "manage_messages": "إدارة الرسائل",
+    "manage_channels": "إدارة الرومات",
+    "manage_guild": "إدارة السيرفر",
+    "manage_roles": "إدارة الرتب",
+    "manage_nicknames": "إدارة الألقاب",
+}
+
+@bot.event
+async def on_command_error(ctx, error):
+    error = getattr(error, "original", error)
+    if isinstance(error, commands.CommandNotFound):
+        return
+    if isinstance(error, commands.MissingPermissions):
+        perms = "، ".join(f"`{PERM_AR.get(p, p)}`" for p in error.missing_permissions)
+        return await send_err(ctx, f"تحتاج الصلاحية: {perms}", "ما عندك صلاحية")
+    if isinstance(error, commands.BotMissingPermissions):
+        perms = "، ".join(f"`{PERM_AR.get(p, p)}`" for p in error.missing_permissions)
+        return await send_err(ctx, f"البوت يحتاج الصلاحية: {perms}", "البوت ما عنده صلاحية")
+    if isinstance(error, commands.MissingRequiredArgument):
+        usage = f"{PREFIX}{ctx.command.qualified_name} {ctx.command.signature}".strip()
+        return await send_err(ctx, f"ناقصك: `{error.param.name}`\n**الاستخدام:** `{usage}`",
+                              "بيانات ناقصة")
+    if isinstance(error, commands.MemberNotFound):
+        return await send_err(ctx, "ما لقيت هذا العضو. استخدم المنشن أو الآيدي.", "عضو غير موجود")
+    if isinstance(error, (commands.UserNotFound,)):
+        return await send_err(ctx, "ما لقيت هذا المستخدم.", "مستخدم غير موجود")
+    if isinstance(error, (commands.BadArgument, commands.BadLiteralArgument,
+                          commands.BadUnionArgument)):
+        usage = f"{PREFIX}{ctx.command.qualified_name} {ctx.command.signature}".strip() if ctx.command else ""
+        return await send_err(ctx, f"مدخلات غير صحيحة.\n**الاستخدام:** `{usage}`", "مدخلات خاطئة")
+    if isinstance(error, commands.NoPrivateMessage):
+        return await send_err(ctx, "هذا الأمر يشتغل داخل السيرفر فقط.")
+    if isinstance(error, commands.CommandOnCooldown):
+        return await send_err(ctx, f"انتظر **{error.retry_after:.0f}** ثانية.", "على مهلك")
+    if isinstance(error, commands.CheckFailure):
+        return await send_err(ctx, "ما تقدر تستخدم هذا الأمر.", "غير مسموح")
+    if isinstance(error, discord.Forbidden):
+        return await send_err(ctx, "البوت ما يقدر ينفذ هذا (رتبته أو صلاحياته ما تكفي).",
+                              "صلاحيات البوت")
+    traceback.print_exception(type(error), error, error.__traceback__)
+    await send_err(ctx, "صار خطأ غير متوقع، حاول مرة ثانية.", "خطأ غير متوقع")
+
+# ---------------------------------------------------------------- الاختصارات العربية (بدون بادئة)
+# الكلمة: (الأمر, الصلاحية المطلوبة, النوع)   النوع: chan = روم / target = عضو / num = رقم
+SHORTCUTS = {
+    "قفل": ("lock", "manage_channels", "chan"),
+    "فتح": ("unlock", "manage_channels", "chan"),
+    "اخفاء": ("hide", "manage_channels", "chan"),
+    "اظهار": ("unhide", "manage_channels", "chan"),
+    "اسكت": ("mute", "moderate_members", "target"),
+    "كتم": ("mute", "moderate_members", "target"),
+    "تكلم": ("unmute", "moderate_members", "target"),
+    "فك كتم": ("unmute", "moderate_members", "target"),
+    "باند": ("ban", "ban_members", "target"),
+    "حظر": ("ban", "ban_members", "target"),
+    "فك باند": ("unban", "ban_members", "target"),
+    "فك حظر": ("unban", "ban_members", "target"),
+    "تحذير": ("warn", "manage_messages", "target"),
+    "انذار": ("warn", "manage_messages", "target"),
+    "تحذيرات": ("warnings", "manage_messages", "target"),
+    "طرد": ("kick", "kick_members", "target"),
+    "مسح": ("clear", "manage_messages", "num"),
+    "سلو": ("slowmode", "manage_channels", "num"),
+}
+
+SHORTCUT_DOC = [
+    ("🔒 قفل / فتح", "قفل أو فتح الشات الحالي (أو `قفل #روم`)"),
+    ("🙈 اخفاء / اظهار", "إخفاء أو إظهار الشات الحالي"),
+    ("🔇 اسكت / كتم", "`اسكت @عضو 30 السبب` — المدة اختيارية (30 / 2h / 1d / 30د / 2س / 1ي)"),
+    ("🔊 تكلم / فك كتم", "`تكلم @عضو`"),
+    ("🔨 باند / حظر", "`باند @عضو السبب`"),
+    ("✅ فك باند / فك حظر", "`فك باند 123456789` بآيدي المحظور"),
+    ("⚠️ تحذير / انذار", "`تحذير @عضو السبب`"),
+    ("📋 تحذيرات", "`تحذيرات @عضو`"),
+    ("👢 طرد", "`طرد @عضو السبب`"),
+    ("🧹 مسح", "`مسح 20` أو `مسح 20 @عضو`"),
+    ("🐢 سلو", "`سلو 5` (0 للإلغاء)"),
+]
+
+def _norm(s: str) -> str:
+    # استبدال حرف بحرف عشان تبقى المواضع نفسها
+    return s.translate(str.maketrans("أإآة", "اااه"))
+
+SHORTCUT_PATTERNS = [
+    (kw, re.compile(r"^" + r"\s+".join(re.escape(p) for p in kw.split()) + r"(?:\s+(.*))?$", re.S))
+    for kw in sorted(SHORTCUTS, key=len, reverse=True)
+]
+
+def _resolve_target(message: discord.Message, rest: str):
+    m = re.match(r"^<@!?(\d{15,22})>\s*(.*)$", rest, re.S)
+    if m:
+        return int(m[1]), m[2].strip()
+    m = re.match(r"^(\d{15,22})\s*(.*)$", rest, re.S)
+    if m:
+        return int(m[1]), m[2].strip()
+    ref = message.reference
+    if ref and isinstance(ref.resolved, discord.Message):
+        return ref.resolved.author.id, rest.strip()
+    return None, rest.strip()
+
+async def run_shortcut(message: discord.Message) -> bool:
+    """يرجع True إذا الرسالة كانت اختصار وانتعاملت."""
+    if (message.author.bot or not message.guild or not message.content
+            or len(message.content) > 300 or not isinstance(message.author, discord.Member)):
+        return False
+    if not conf(message.guild.id)["shortcuts"]["enabled"]:
+        return False
+
+    text = message.content.strip()
+    norm = _norm(text)
+    hit = None
+    for kw, pat in SHORTCUT_PATTERNS:
+        m = pat.match(norm)
+        if m:
+            hit = (kw, text[m.start(1):].strip() if m.group(1) else "")
+            break
+    if not hit:
+        return False
+    kw, rest = hit
+    cmd, perm, kind = SHORTCUTS[kw]
+
+    # بدون صلاحية → نتجاهل بصمت عشان ما نتعارض مع الكلام العادي
+    if not getattr(message.author.guild_permissions, perm, False):
+        return False
+
+    if kind == "chan":
+        if rest and not rest.startswith("<#"):
+            return False
+        line = f"{cmd} {rest}".strip()
+    elif kind == "target":
+        tid, reason = _resolve_target(message, rest)
+        if tid is None:
+            if rest:           # جملة عادية فيها الكلمة، مو أمر
+                return False
+            await message.channel.send(embed=err_e(
+                f"حدد العضو: `{kw} @العضو [السبب]`\nأو رد على رسالته بكلمة `{kw}`.",
+                "ما حددت العضو"), delete_after=8)
+            return True
+        if cmd == "mute":
+            first = reason.split(None, 1)[0] if reason else ""
+            if not DUR_RE.match(first):
+                reason = f"10m {reason}".strip()
+        line = f"{cmd} {tid} {reason}".strip()
+    else:  # num
+        m = re.match(r"^(\d{1,4})(?:\s+(.*))?$", rest, re.S)
+        if not m:
+            if rest:
+                return False
+            await message.channel.send(embed=err_e(
+                f"اكتب الرقم: `{kw} 10`", "ما حددت الرقم"), delete_after=8)
+            return True
+        line = f"{cmd} {rest}".strip()
+
+    # نحوّل الاختصار لأمر حقيقي — فتنطبق عليه نفس الصلاحيات والحماية
+    orig = message.content
+    message.content = f"{PREFIX}{line}"
+    try:
+        ctx = await bot.get_context(message)
+    finally:
+        message.content = orig
+    if not ctx.valid:
+        return False
+    await bot.invoke(ctx)
+    return True
+
+@bot.event
+async def on_message(message: discord.Message):
+    if await run_shortcut(message):
+        return
+    await bot.process_commands(message)
+
+@bot.hybrid_command(name="shortcuts", aliases=["اختصارات"], description="عرض / تشغيل / إيقاف الاختصارات العربية")
+@commands.guild_only()
+async def shortcuts_cmd(ctx, action: Literal["list", "on", "off"] = "list"):
+    s = conf(ctx.guild.id)["shortcuts"]
+    if action != "list":
+        if not ctx.author.guild_permissions.manage_guild:
+            return await send_err(ctx, "تحتاج الصلاحية: `إدارة السيرفر`", "ما عندك صلاحية")
+        s["enabled"] = action == "on"
+        save_data()
+        return await ctx.send(embed=ok_e("الاختصارات", "✅ **مفعّلة**" if s["enabled"] else "⏸️ **متوقفة**"))
+    e = fancy("⚡ الاختصارات العربية", color=C_INFO,
+              desc=f"اكتبها في الشات **بدون بادئة** — الحالة: {'🟢 مفعّلة' if s['enabled'] else '🔴 متوقفة'}")
+    for n, v in SHORTCUT_DOC:
+        e.add_field(name=n, value=v, inline=False)
+    e.add_field(name="🛡️ الحماية", inline=False, value=(
+        "• تشتغل فقط لمن عنده **نفس صلاحية الأمر الأصلي**.\n"
+        "• غير المخوّل يُتجاهل بصمت — ما تتعارض مع كلام الأعضاء.\n"
+        "• أوامر الأعضاء لازم **منشن / آيدي / رد** على الرسالة.\n"
+        "• نفس فحص الرتب والهرمية مثل أوامر السلاش."))
+    await ctx.send(embed=e)
+
+# ---------------------------------------------------------------- القائمة (Help)
+HELP_CATS = [
+    ("home", "🏠", "الرئيسية"), ("general", "🌐", "عامة"), ("mod", "🛡️", "إدارية"),
+    ("prot", "🔰", "الحماية والسجلات"), ("welcome", "👋", "الترحيب"),
+    ("tickets", "🎫", "التذاكر"), ("inside", "🎛️", "تخصيص التذكرة"), ("short", "⚡", "الاختصارات"),
+    ("extras", "🕌", "أذكار وإضافات"),
+]
+
+def help_embed(key: str) -> discord.Embed:
+    P = PREFIX
+    e = fancy(color=C_INFO)
+    e.set_author(name=f"{BOT_NAME} • قائمة الأوامر", icon_url=bot.user.display_avatar.url if bot.user else None)
+    if key == "home":
+        e.description = (
+            f"أهلاً بك في **{BOT_NAME}** 👋\n"
+            "كل الأوامر تشتغل بالبادئة `" + P + "` أو بالسلاش `/`\n"
+            "واختر القسم من القائمة تحت.\n\n"
+            "🌐 **عامة** — معلومات وأدوات\n🛡️ **إدارية** — عقوبات وإدارة الرومات\n"
+            "🔰 **الحماية** — القوانين، الروابط، السجلات\n👋 **الترحيب**\n🎫 **التذاكر**\n"
+            "⚡ **الاختصارات** — `قفل` `فتح` `اسكت` `باند` ... بدون بادئة")
+        e.add_field(name="💡 متغيرات النصوص", inline=False,
+                    value="`{user}` `{name}` `{server}` `{count}`\nداخل التذكرة: `{date}` `{reason}` "
+                          "`{type}` `{ticket}` `{support}` `{claimed}`\nللسطر الجديد في السلاش اكتب `\\n`")
+    elif key == "general":
+        e.title = "🌐 الأوامر العامة"
+        e.description = (
+            f"`{P}ping` `{P}avatar` `{P}banner` `{P}userinfo` `{P}serverinfo`\n"
+            f"`{P}botinfo` `{P}roleinfo` `{P}membercount` `{P}say`\n"
+            f"`{P}poll` `{P}announce` `{P}roll` `{P}coinflip` `{P}snipe`")
+    elif key == "mod":
+        e.title = "🛡️ الأوامر الإدارية"
+        e.add_field(name="👥 الأعضاء", inline=False, value=(
+            f"`{P}kick` `{P}ban` `{P}unban` `{P}mute` `{P}unmute`\n"
+            f"`{P}warn` `{P}unwarn` `{P}warnings` `{P}clearwarns` `{P}warnsystem`\n"
+            f"`{P}nick` `{P}addrole` `{P}removerole` `{P}history` `{P}case`"))
+        e.add_field(name="💬 الرومات", inline=False, value=(
+            f"`{P}clear` `{P}lock` `{P}unlock` `{P}hide` `{P}unhide`\n"
+            f"`{P}nuke` `{P}slowmode`"))
+    elif key == "prot":
+        e.title = "🔰 الحماية والسجلات"
+        e.description = (f"`{P}rulesguard` `{P}rulesoff` `{P}rulesexempt`\n"
+                         f"`{P}antilink` `{P}badword` `{P}setmodlog`\n"
+                         f"**💬 الردود التلقائية:** `{P}replyadd` `{P}replydel` `{P}replymode` "
+                         f"`{P}replylist` `{P}replytoggle`")
+    elif key == "welcome":
+        e.title = "👋 الترحيب والمغادرة"
+        e.description = (f"`{P}setwelcome` `{P}welcomeset` `{P}welcomeimage` `{P}welcomebanner` `{P}welcomethumb`\n"
+                         f"`{P}welcomestyle` `{P}welcomereset` `{P}testwelcome`\n"
+                         f"`{P}setleave` `{P}leavemsg` `{P}autorole`\n"
+                         "متغيرات الترحيب: `{username}` `{inviter}` `{number}` `{date}` `{user}` `{name}` `{server}` `{count}`")
+    elif key == "tickets":
+        e.title = "🎫 التذاكر"
+        e.description = (
+            f"`{P}ticketpanel` `{P}panelset` `{P}panelimage`\n"
+            f"`{P}ticketadd` `{P}ticketdel` `{P}ticketlist` `{P}ticketlog`\n"
+            f"`{P}tadd` `{P}tremove` `{P}tclose` `{P}tclaim` `{P}tunclaim`\n"
+            f"`{P}trename` `{P}tpriority` `{P}tlock` `{P}tunlock`\n"
+            f"`{P}ttranscript` `{P}tblacklist` `{P}tmax` `{P}tautoclose` `{P}tstats`\n"
+            f"`{P}points` `{P}topstaff` `{P}pointsadmin` `{P}pointsvalue` `{P}pointsreset`")
+    elif key == "inside":
+        e.title = "🎛️ تخصيص داخل التذكرة"
+        e.description = (
+            f"`{P}insideset` `{P}insideimage` `{P}insideimageoff` `{P}insidethumb`\n"
+            f"`{P}insidebtn` `{P}insidereason` `{P}insidepreview`")
+    elif key == "extras":
+        e.title = "🕌 الأذكار وتيك توك والتحدث باسم البوت"
+        e.add_field(name="🕌 الأذكار", inline=False, value=(
+            f"`{P}azkarchannel` `{P}azkarinterval` `{P}azkarsession`\n"
+            f"`{P}azkaradd` `{P}azkarnow`"))
+        e.add_field(name="🎬 تيك توك", inline=False, value=f"`{P}tiktokset` `{P}tiktokoff`")
+        e.add_field(name="🗣️ التحدث باسم البوت", inline=False, value=f"`{P}relayset` `{P}relayoff`")
+        e.add_field(name="📥 تحميل تيك توك", inline=False, value=f"`{P}tt` + رابط المقطع (بدون علامة مائية)")
+        e.add_field(name="📝 نظام التقديم", inline=False,
+                    value=f"`{P}apply` ← new / channel / questions / role / reviewers / text / image / color / open / close / panel / list / show / delete")
+        e.add_field(name="🖼️ الافتارات (Respect / MT)", inline=False,
+                    value=f"`{P}avtset` ← servers / channel / text / image / color / status / panel / show\nللأعضاء: `/avt`")
+        e.add_field(name="🎙️ الرومات الصوتية المؤقتة", inline=False,
+                    value=f"`{P}tempvoice` `{P}tempvoicepanel` `{P}tempvoicename` `{P}tempvoiceoff`\n`{P}tempvoiceemoji` `{P}tempvoiceimage` `{P}tempvoicetext`")
+    else:
+        e.title = "⚡ الاختصارات العربية"
+        e.description = f"اكتبها بدون بادئة — اكتب `{P}shortcuts` للتفاصيل."
+        for n, v in SHORTCUT_DOC:
+            e.add_field(name=n, value=v, inline=False)
+    return e
+
+class HelpSelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(placeholder="📂 اختر القسم...", options=[
+            discord.SelectOption(label=name, value=k, emoji=em) for k, em, name in HELP_CATS])
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.view.owner_id:
+            return await interaction.response.send_message("❌ هذي القائمة مو لك، اكتب الأمر بنفسك.", ephemeral=True)
+        await interaction.response.edit_message(embed=help_embed(self.values[0]), view=self.view)
+
+class HelpView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+        self.add_item(HelpSelect())
+
+# ---------------------------------------------------------------- الأوامر العامة
+@bot.hybrid_command(name="help", aliases=["مساعدة", "اوامر"], description="قائمة الأوامر")
+async def help_cmd(ctx):
+    await ctx.send(embed=help_embed("home"), view=HelpView(ctx.author.id))
+
+@bot.hybrid_command(name="ping", aliases=["بنق"], description="سرعة البوت")
+async def ping(ctx):
+    t0 = time.perf_counter()
+    msg = await ctx.send(embed=info_e("🏓 جاري القياس..."))
+    api = round((time.perf_counter() - t0) * 1000)
+    e = info_e("🏓 Pong!")
+    e.add_field(name="📡 الاتصال", value=f"`{round(bot.latency * 1000)}ms`")
+    e.add_field(name="⏱️ الاستجابة", value=f"`{api}ms`")
+    await msg.edit(embed=e)
+
+@bot.hybrid_command(name="avatar", aliases=["افتار"], description="صورة العضو")
+async def avatar(ctx, member: discord.Member = None):
+    member = member or ctx.author
+    e = fancy(f"🖼️ صورة {member.display_name}", color=member.color.value or C_INFO)
+    e.set_image(url=member.display_avatar.url)
+    view = discord.ui.View()
+    for fm in ("png", "jpg", "webp"):
+        view.add_item(discord.ui.Button(label=fm.upper(), url=member.display_avatar.with_format(fm).url))
+    await ctx.send(embed=e, view=view)
+
+@bot.hybrid_command(name="banner", aliases=["بنر"], description="بنر العضو")
+async def banner(ctx, member: discord.Member = None):
+    member = member or ctx.author
+    user = await bot.fetch_user(member.id)
+    if not user.banner:
+        return await send_err(ctx, f"{member.mention} ما عنده بنر.", "ما فيه بنر")
+    e = fancy(f"🎨 بنر {member.display_name}", color=user.accent_color.value if user.accent_color else C_INFO)
+    e.set_image(url=user.banner.url)
+    await ctx.send(embed=e)
+
+BADGES = {
+    "staff": "🛠️ طاقم ديسكورد", "partner": "🤝 شريك", "hypesquad": "🎉 HypeSquad",
+    "bug_hunter": "🐛 صائد ثغرات", "hypesquad_bravery": "🟣 Bravery",
+    "hypesquad_brilliance": "🟠 Brilliance", "hypesquad_balance": "🟢 Balance",
+    "early_supporter": "💎 داعم مبكر", "verified_bot_developer": "🤖 مطور بوتات",
+    "active_developer": "👨‍💻 مطور نشط", "discord_certified_moderator": "🛡️ مشرف معتمد",
+}
+
+@bot.hybrid_command(name="userinfo", aliases=["معلومات", "ui"], description="معلومات عضو")
+@commands.guild_only()
+async def userinfo(ctx, member: discord.Member = None):
+    member = member or ctx.author
+    roles = [r.mention for r in reversed(member.roles) if r != ctx.guild.default_role]
+    badges = [v for k, v in BADGES.items() if getattr(member.public_flags, k, False)]
+    pos = sorted(ctx.guild.members, key=lambda m: m.joined_at or discord.utils.utcnow()).index(member) + 1
+    warns = len(conf(ctx.guild.id)["warns"].get(str(member.id), []))
+    e = fancy(f"👤 {member}", color=member.color.value or C_INFO)
+    e.set_thumbnail(url=member.display_avatar.url)
+    e.add_field(name="🆔 الآيدي", value=f"`{member.id}`")
+    e.add_field(name="📛 الاسم", value=member.display_name)
+    e.add_field(name="🔢 ترتيب الدخول", value=f"#{pos}")
+    e.add_field(name="📅 إنشاء الحساب", value=discord.utils.format_dt(member.created_at, "D") + "\n" + discord.utils.format_dt(member.created_at, "R"))
+    e.add_field(name="📥 دخول السيرفر", value=discord.utils.format_dt(member.joined_at, "D") + "\n" + discord.utils.format_dt(member.joined_at, "R"))
+    e.add_field(name="⚠️ التحذيرات", value=str(warns))
+    flags = []
+    if member.guild_permissions.administrator:
+        flags.append("👑 مدير")
+    if member.is_timed_out():
+        flags.append("🔇 مكتوم")
+    if member.premium_since:
+        flags.append("💜 بوستر")
+    if member.bot:
+        flags.append("🤖 بوت")
+    if flags or badges:
+        e.add_field(name="🏅 الحالة والشارات", value=" • ".join(flags + badges), inline=False)
+    e.add_field(name=f"🎭 الرتب ({len(roles)})", value=" ".join(roles[:15]) or "لا يوجد", inline=False)
+    await ctx.send(embed=e)
+
+@bot.hybrid_command(name="serverinfo", aliases=["سيرفر", "si"], description="معلومات السيرفر")
+@commands.guild_only()
+async def serverinfo(ctx):
+    g = ctx.guild
+    bots = sum(1 for m in g.members if m.bot)
+    e = fancy(f"🏠 {g.name}")
+    if g.icon:
+        e.set_thumbnail(url=g.icon.url)
+    if g.banner:
+        e.set_image(url=g.banner.url)
+    e.add_field(name="👑 المالك", value=g.owner.mention if g.owner else "؟")
+    e.add_field(name="🆔 الآيدي", value=f"`{g.id}`")
+    e.add_field(name="📅 الإنشاء", value=discord.utils.format_dt(g.created_at, "D"))
+    e.add_field(name="👥 الأعضاء", value=f"**{g.member_count}**\n👤 {g.member_count - bots} • 🤖 {bots}")
+    e.add_field(name="💬 الرومات", value=f"📝 {len(g.text_channels)} • 🔊 {len(g.voice_channels)}\n📁 {len(g.categories)}")
+    e.add_field(name="🎭 الرتب", value=str(len(g.roles)))
+    e.add_field(name="😀 الإيموجي", value=str(len(g.emojis)))
+    e.add_field(name="💜 البوست", value=f"{g.premium_subscription_count} (لفل {g.premium_tier})")
+    e.add_field(name="🔐 التحقق", value=str(g.verification_level).title())
+    await ctx.send(embed=e)
+
+@bot.hybrid_command(name="membercount", aliases=["اعضاء"], description="عدد الأعضاء")
+@commands.guild_only()
+async def membercount(ctx):
+    g = ctx.guild
+    bots = sum(1 for m in g.members if m.bot)
+    e = fancy("👥 أعضاء السيرفر", f"# {g.member_count}")
+    e.add_field(name="👤 أعضاء", value=str(g.member_count - bots))
+    e.add_field(name="🤖 بوتات", value=str(bots))
+    await ctx.send(embed=e)
+
+@bot.hybrid_command(name="roleinfo", aliases=["رتبة"], description="معلومات رتبة")
+@commands.guild_only()
+async def roleinfo(ctx, role: discord.Role):
+    keys = [PERM_AR[p] for p in PERM_AR if getattr(role.permissions, p, False)]
+    e = fancy(f"🎭 {role.name}", color=role.color.value or C_INFO)
+    e.add_field(name="🆔 الآيدي", value=f"`{role.id}`")
+    e.add_field(name="👥 الأعضاء", value=str(len(role.members)))
+    e.add_field(name="🎨 اللون", value=f"`{role.color}`")
+    e.add_field(name="📶 الترتيب", value=str(role.position))
+    e.add_field(name="📌 منفصلة", value="نعم" if role.hoist else "لا")
+    e.add_field(name="🔔 قابلة للمنشن", value="نعم" if role.mentionable else "لا")
+    e.add_field(name="📅 الإنشاء", value=discord.utils.format_dt(role.created_at, "D"))
+    if keys:
+        e.add_field(name="🔑 صلاحيات مهمة", value="، ".join(keys), inline=False)
+    await ctx.send(embed=e)
+
+@bot.hybrid_command(name="botinfo", aliases=["بوت"], description="معلومات البوت")
+async def botinfo(ctx):
+    up = datetime.datetime.now(datetime.timezone.utc) - START_TIME
+    d, rem = divmod(int(up.total_seconds()), 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    e = fancy(f"🤖 {BOT_NAME}")
+    e.set_thumbnail(url=bot.user.display_avatar.url)
+    e.add_field(name="🏠 السيرفرات", value=str(len(bot.guilds)))
+    e.add_field(name="👥 المستخدمين", value=str(sum(g.member_count for g in bot.guilds)))
+    e.add_field(name="⌨️ الأوامر", value=str(len(bot.commands)))
+    e.add_field(name="⏳ مدة التشغيل", value=f"{d}ي {h}س {m}د {s}ث")
+    e.add_field(name="📡 البنق", value=f"`{round(bot.latency * 1000)}ms`")
+    e.add_field(name="🐍 Python", value=platform.python_version())
+    e.add_field(name="📚 discord.py", value=discord.__version__)
+    await ctx.send(embed=e)
+
+@bot.hybrid_command(name="say", aliases=["قول"], description="البوت يكرر كلامك")
+@commands.has_permissions(manage_messages=True)
+@commands.guild_only()
+async def say(ctx, *, text: str):
+    if ctx.interaction:
+        await ctx.send(embed=ok_e("تم الإرسال"), ephemeral=True)
+        await ctx.channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+    else:
+        try:
+            await ctx.message.delete()
+        except discord.HTTPException:
+            pass
+        await ctx.send(text, allowed_mentions=discord.AllowedMentions.none())
+
+@bot.hybrid_command(name="poll", aliases=["تصويت"], description="تصويت — الخيارات مفصولة بـ |")
+@commands.has_permissions(manage_messages=True)
+@commands.guild_only()
+async def poll(ctx, question: str, *, options: str):
+    opts = [o.strip() for o in options.split("|") if o.strip()]
+    if not 2 <= len(opts) <= 10:
+        return await send_err(ctx, "من 2 إلى 10 خيارات مفصولة بـ `|`\nمثال: `poll \"سؤالك\" خيار1 | خيار2`", "خيارات غير صحيحة")
+    nums = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    e = fancy(f"📊 {question}", "\n\n".join(f"{nums[i]}  {o}" for i, o in enumerate(opts)))
+    e.set_author(name=ctx.author.display_name, icon_url=ctx.author.display_avatar.url)
+    msg = await ctx.channel.send(embed=e)
+    for i in range(len(opts)):
+        await msg.add_reaction(nums[i])
+    if ctx.interaction:
+        await ctx.send(embed=ok_e("تم إنشاء التصويت"), ephemeral=True)
+
+@bot.hybrid_command(name="announce", aliases=["اعلان"], description="إرسال إعلان في روم")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def announce(ctx, channel: discord.TextChannel, *, text: str):
+    e = fancy("📢 إعلان", nl(text))
+    e.set_author(name=ctx.guild.name, icon_url=ctx.guild.icon.url if ctx.guild.icon else None)
+    await channel.send(embed=e)
+    await ctx.send(embed=ok_e("تم نشر الإعلان", channel.mention), ephemeral=True)
+
+@bot.hybrid_command(name="roll", aliases=["نرد"], description="رمي نرد")
+async def roll(ctx, sides: int = 6):
+    if not 2 <= sides <= 1000:
+        return await send_err(ctx, "الأوجه من 2 إلى 1000.", "رقم غير صحيح")
+    await ctx.send(embed=info_e("🎲 النرد", f"طلع لك **{random.randint(1, sides)}** من {sides}"))
+
+@bot.hybrid_command(name="coinflip", aliases=["عملة"], description="صورة أو كتابة")
+async def coinflip(ctx):
+    await ctx.send(embed=info_e("🪙 العملة", random.choice(["**صورة**", "**كتابة**"])))
+
+# آخر رسالة انحذفت في كل روم (للأمر snipe)
+SNIPES: dict[int, dict] = {}
+
+@bot.listen("on_message_delete")
+async def snipe_store(message: discord.Message):
+    if not message.guild or message.author.bot:
+        return
+    if not message.content and not message.attachments:
+        return
+    SNIPES[message.channel.id] = {
+        "author": message.author, "content": message.content or "",
+        "files": [a.url for a in message.attachments], "time": discord.utils.utcnow()}
+
+@bot.hybrid_command(name="snipe", aliases=["سنايب"], description="آخر رسالة انحذفت في الروم")
+@commands.has_permissions(manage_messages=True)
+@commands.guild_only()
+async def snipe(ctx):
+    s = SNIPES.get(ctx.channel.id)
+    if not s:
+        return await send_err(ctx, "ما فيه رسائل محذوفة حديثة في هذا الروم.", "ما فيه شي")
+    e = fancy("🕵️ آخر رسالة محذوفة", s["content"][:2000] or "—", C_WARN)
+    e.set_author(name=str(s["author"]), icon_url=s["author"].display_avatar.url)
+    if s["files"]:
+        e.add_field(name="📎 مرفقات", value="\n".join(s["files"][:5]), inline=False)
+    e.add_field(name="🕐 انحذفت", value=discord.utils.format_dt(s["time"], "R"))
+    await ctx.send(embed=e)
+
+# ---------------------------------------------------------------- الأوامر الإدارية: العقوبات
+@bot.hybrid_command(name="kick", aliases=["طرد"], description="طرد عضو")
+@commands.has_permissions(kick_members=True)
+@commands.bot_has_permissions(kick_members=True)
+@commands.guild_only()
+async def kick(ctx, member: discord.Member, *, reason: str = "بدون سبب"):
+    err = can_act(ctx, member)
+    if err:
+        return await send_err(ctx, err)
+    await notify(member, ctx.guild, "👢", "تم طردك من السيرفر", reason, C_WARN)
+    await member.kick(reason=f"{ctx.author}: {reason}")
+    await finish_mod(ctx, "👢", "تم الطرد", member, reason, C_WARN)
+
+@bot.hybrid_command(name="ban", aliases=["باند", "حظر"], description="حظر عضو (أو آيدي مستخدم)")
+@commands.has_permissions(ban_members=True)
+@commands.bot_has_permissions(ban_members=True)
+@commands.guild_only()
+async def ban(ctx, user: discord.User, *, reason: str = "بدون سبب"):
+    member = ctx.guild.get_member(user.id)
+    if member:
+        err = can_act(ctx, member)
+        if err:
+            return await send_err(ctx, err)
+        await notify(member, ctx.guild, "🔨", "تم حظرك من السيرفر", reason, C_ERR)
+    elif user.id == ctx.author.id:
+        return await send_err(ctx, "ما تقدر تنفذ هذا على نفسك.")
+    await ctx.guild.ban(user, reason=f"{ctx.author}: {reason}")
+    await finish_mod(ctx, "🔨", "تم الحظر", user, reason, C_ERR)
+
+@bot.hybrid_command(name="unban", aliases=["فكباند", "فك_باند"], description="فك الحظر بالآيدي")
+@commands.has_permissions(ban_members=True)
+@commands.bot_has_permissions(ban_members=True)
+@commands.guild_only()
+async def unban(ctx, user_id: str, *, reason: str = "بدون سبب"):
+    digits = re.sub(r"\D", "", user_id)
+    if not digits:
+        return await send_err(ctx, "اكتب آيدي المحظور.", "آيدي غير صحيح")
+    try:
+        user = await bot.fetch_user(int(digits))
+        await ctx.guild.fetch_ban(user)
+    except discord.NotFound:
+        return await send_err(ctx, "هذا الشخص مو محظور أو الآيدي غلط.", "ما لقيت الحظر")
+    await ctx.guild.unban(user, reason=f"{ctx.author}: {reason}")
+    await finish_mod(ctx, "✅", "تم فك الحظر", user, reason, C_OK)
+
+@bot.hybrid_command(name="mute", aliases=["اسكت", "كتم"], description="كتم عضو (تايم أوت) — المدة مثل 30 أو 2h أو 1d")
+@commands.has_permissions(moderate_members=True)
+@commands.bot_has_permissions(moderate_members=True)
+@commands.guild_only()
+async def mute(ctx, member: discord.Member, duration: str = "10m", *, reason: str = "بدون سبب"):
+    err = can_act(ctx, member)
+    if err:
+        return await send_err(ctx, err)
+    minutes = parse_duration(duration)
+    if minutes is None:
+        return await send_err(ctx, "المدة غير صحيحة. أمثلة: `30` `30m` `2h` `1d` `30د` `2س` `1ي`", "مدة غير صحيحة")
+    if not 1 <= minutes <= 40320:
+        return await send_err(ctx, "المدة من دقيقة إلى 28 يوم.", "مدة غير مسموحة")
+    until = discord.utils.utcnow() + datetime.timedelta(minutes=minutes)
+    await member.timeout(datetime.timedelta(minutes=minutes), reason=f"{ctx.author}: {reason}")
+    await notify(member, ctx.guild, "🔇", "تم كتمك", reason, C_WARN, [("⏳ المدة", human_minutes(minutes))])
+    await finish_mod(ctx, "🔇", "تم الكتم", member, reason, C_WARN, [
+        ("⏳ المدة", human_minutes(minutes)),
+        ("🔓 ينتهي", discord.utils.format_dt(until, "R"))])
+
+@bot.hybrid_command(name="unmute", aliases=["تكلم"], description="فك الكتم")
+@commands.has_permissions(moderate_members=True)
+@commands.bot_has_permissions(moderate_members=True)
+@commands.guild_only()
+async def unmute(ctx, member: discord.Member, *, reason: str = "بدون سبب"):
+    if not member.is_timed_out():
+        return await send_err(ctx, f"{member.mention} مو مكتوم.", "العضو مو مكتوم")
+    await member.timeout(None, reason=f"{ctx.author}: {reason}")
+    await finish_mod(ctx, "🔊", "تم فك الكتم", member, reason, C_OK)
+
+@bot.hybrid_command(name="warn", aliases=["تحذير", "انذار"], description="تحذير عضو")
+@commands.has_permissions(manage_messages=True)
+@commands.guild_only()
+async def warn(ctx, member: discord.Member, *, reason: str = "بدون سبب"):
+    err = can_act(ctx, member)
+    if err:
+        return await send_err(ctx, err)
+    c = conf(ctx.guild.id)
+    lst = c["warns"].setdefault(str(member.id), [])
+    lst.append({"reason": reason, "mod": ctx.author.id,
+                "time": datetime.datetime.now(datetime.timezone.utc).isoformat()})
+    save_data()
+    extra = [("📊 إجمالي التحذيرات", f"**{len(lst)}**")]
+    await notify(member, ctx.guild, "⚠️", "وصلك تحذير", reason, C_WARN, extra)
+
+    ws = c["warnsys"]
+    auto = None
+    if ws["threshold"] and len(lst) % ws["threshold"] == 0:
+        try:
+            if ws["action"] == "mute":
+                await member.timeout(datetime.timedelta(minutes=ws["minutes"]), reason="تحذيرات متراكمة")
+                auto = f"كتم {human_minutes(ws['minutes'])}"
+            elif ws["action"] == "kick":
+                await member.kick(reason="تحذيرات متراكمة")
+                auto = "طرد"
+            elif ws["action"] == "ban":
+                await member.ban(reason="تحذيرات متراكمة")
+                auto = "حظر"
+        except discord.HTTPException:
+            auto = None
+    if auto:
+        extra.append(("⚡ عقوبة تلقائية", auto))
+    await finish_mod(ctx, "⚠️", "تم التحذير", member, reason, C_WARN, extra)
+
+@bot.hybrid_command(name="warnsystem", aliases=["نظام_التحذيرات"], description="عقوبة تلقائية كل X تحذيرات (0 للإيقاف)")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def warnsystem(ctx, threshold: int, action: Literal["mute", "kick", "ban"] = "mute", minutes: int = 60):
+    if not 0 <= threshold <= 20:
+        return await send_err(ctx, "العدد من 0 إلى 20 (0 = إيقاف).", "رقم غير صحيح")
+    if not 1 <= minutes <= 40320:
+        return await send_err(ctx, "مدة الكتم من 1 إلى 40320 دقيقة.", "رقم غير صحيح")
+    ws = conf(ctx.guild.id)["warnsys"]
+    ws.update(threshold=threshold, action=action, minutes=minutes)
+    save_data()
+    if not threshold:
+        return await ctx.send(embed=ok_e("العقوبة التلقائية", "⏸️ تم الإيقاف"))
+    detail = f"كتم {human_minutes(minutes)}" if action == "mute" else ("طرد" if action == "kick" else "حظر")
+    await ctx.send(embed=ok_e("العقوبة التلقائية", f"كل **{threshold}** تحذيرات → **{detail}**"))
+
+@bot.hybrid_command(name="warnings", aliases=["تحذيرات"], description="عرض تحذيرات عضو")
+@commands.has_permissions(manage_messages=True)
+@commands.guild_only()
+async def warnings(ctx, member: discord.Member):
+    lst = conf(ctx.guild.id)["warns"].get(str(member.id), [])
+    if not lst:
+        return await ctx.send(embed=ok_e("سجل نظيف", f"{member.mention} ما عنده تحذيرات."))
+    lines = []
+    for i, w in enumerate(lst[-15:], max(1, len(lst) - 14)):
+        try:
+            ts = f"<t:{int(datetime.datetime.fromisoformat(w['time']).timestamp())}:R>"
+        except (KeyError, ValueError):
+            ts = ""
+        lines.append(f"**#{i}** {ts}\n└ {w['reason']} — <@{w['mod']}>")
+    e = warn_e(f"تحذيرات {member.display_name}", "\n".join(lines))
+    e.set_thumbnail(url=member.display_avatar.url)
+    e.add_field(name="📊 الإجمالي", value=str(len(lst)))
+    await ctx.send(embed=e)
+
+@bot.hybrid_command(name="unwarn", aliases=["حذف_تحذير"], description="حذف تحذير واحد من عضو (برقمه)")
+@commands.has_permissions(manage_messages=True)
+@commands.guild_only()
+async def unwarn(ctx, member: discord.Member, number: int = 1):
+    lst = conf(ctx.guild.id)["warns"].get(str(member.id), [])
+    if not 1 <= number <= len(lst):
+        return await send_err(ctx, f"رقم التحذير غير صحيح. عنده **{len(lst)}** تحذير.", "رقم غير صحيح")
+    removed = lst.pop(number - 1)
+    save_data()
+    await finish_mod(ctx, "🧽", "تم حذف تحذير", member, removed["reason"], C_OK,
+                     [("📊 المتبقي", f"**{len(lst)}**")])
+
+@bot.hybrid_command(name="clearwarns", aliases=["مسح_التحذيرات"], description="مسح كل تحذيرات عضو")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def clearwarns(ctx, member: discord.Member):
+    old = conf(ctx.guild.id)["warns"].pop(str(member.id), [])
+    save_data()
+    await finish_mod(ctx, "🧹", "تم مسح التحذيرات", member, "مسح كامل", C_OK,
+                     [("🗑️ انمسح", f"**{len(old)}**")])
+
+@bot.hybrid_command(name="history", aliases=["سجل"], description="سجل العقوبات على عضو")
+@commands.has_permissions(manage_messages=True)
+@commands.guild_only()
+async def history(ctx, member: discord.User):
+    cs = [x for x in conf(ctx.guild.id)["cases"]["list"] if x["target"] == member.id]
+    if not cs:
+        return await ctx.send(embed=ok_e("سجل نظيف", f"{member.mention} ما عليه أي حالات."))
+    lines = []
+    for x in cs[-15:][::-1]:
+        ts = int(datetime.datetime.fromisoformat(x["time"]).timestamp())
+        lines.append(f"**#{x['id']}** {x['action']} • <t:{ts}:R>\n└ {x['reason'][:80]} — <@{x['mod']}>")
+    e = info_e(f"📁 سجل {member.display_name}", "\n".join(lines))
+    e.set_thumbnail(url=member.display_avatar.url)
+    e.add_field(name="📊 إجمالي الحالات", value=str(len(cs)))
+    await ctx.send(embed=e)
+
+@bot.hybrid_command(name="case", aliases=["حالة"], description="عرض حالة عقوبة برقمها")
+@commands.has_permissions(manage_messages=True)
+@commands.guild_only()
+async def case_cmd(ctx, number: int):
+    x = next((c for c in conf(ctx.guild.id)["cases"]["list"] if c["id"] == number), None)
+    if not x:
+        return await send_err(ctx, "ما لقيت حالة بهذا الرقم.", "حالة غير موجودة")
+    ts = discord.utils.format_dt(datetime.datetime.fromisoformat(x["time"]), "F")
+    e = info_e(f"📁 حالة #{x['id']} — {x['action']}")
+    e.add_field(name="👤 العضو", value=f"<@{x['target']}>\n`{x['target']}`")
+    e.add_field(name="🛡️ المسؤول", value=f"<@{x['mod']}>")
+    e.add_field(name="🕐 الوقت", value=ts)
+    e.add_field(name="📝 السبب", value=x["reason"][:1000], inline=False)
+    await ctx.send(embed=e)
+
+# ---------------------------------------------------------------- الأوامر الإدارية: الرومات والأعضاء
+@bot.hybrid_command(name="clear", aliases=["مسح"], description="مسح رسائل (مع إمكانية تحديد عضو)")
+@commands.has_permissions(manage_messages=True)
+@commands.bot_has_permissions(manage_messages=True)
+@commands.guild_only()
+async def clear(ctx, amount: int, member: Optional[discord.Member] = None):
+    if not 1 <= amount <= 100:
+        return await send_err(ctx, "العدد من 1 إلى 100.", "عدد غير صحيح")
+    if ctx.interaction:
+        await ctx.defer(ephemeral=True)
+    else:
+        try:
+            await ctx.message.delete()
+        except discord.HTTPException:
+            pass
+    count = 0
+
+    def check(m: discord.Message) -> bool:
+        nonlocal count
+        if m.pinned or count >= amount:
+            return False
+        if member and m.author.id != member.id:
+            return False
+        count += 1
+        return True
+
+    deleted = await ctx.channel.purge(limit=100 if member else amount, check=check)
+    e = ok_e("تم مسح الرسائل")
+    e.add_field(name="🗑️ العدد", value=f"**{len(deleted)}**")
+    e.add_field(name="💬 الروم", value=ctx.channel.mention)
+    e.add_field(name="🛡️ بواسطة", value=ctx.author.mention)
+    if member:
+        e.add_field(name="🎯 رسائل", value=member.mention)
+    if ctx.interaction:
+        await ctx.send(embed=e, ephemeral=True)
+    else:
+        await ctx.send(embed=e, delete_after=5)
+    cid = conf(ctx.guild.id)["modlog"]["channel"]
+    if cid and cid != ctx.channel.id:
+        await modlog(ctx.guild, e)
+
+def _chan_embed(emoji, title, ch, mod, reason, color):
+    e = fancy(f"{emoji} {title}", color=color)
+    e.add_field(name="💬 الروم", value=ch.mention)
+    e.add_field(name="🛡️ بواسطة", value=mod.mention)
+    e.add_field(name="📝 السبب", value=reason or "بدون سبب", inline=False)
+    return e
+
+@bot.hybrid_command(name="lock", aliases=["قفل"], description="قفل الروم")
+@commands.has_permissions(manage_channels=True)
+@commands.bot_has_permissions(manage_channels=True)
+@commands.guild_only()
+async def lock(ctx, channel: Optional[discord.TextChannel] = None, *, reason: str = "بدون سبب"):
+    ch = channel or ctx.channel
+    ow = ch.overwrites_for(ctx.guild.default_role)
+    if ow.send_messages is False:
+        return await send_err(ctx, f"{ch.mention} مقفل من قبل.", "الروم مقفل أصلاً")
+    ow.send_messages = False
+    await ch.set_permissions(ctx.guild.default_role, overwrite=ow, reason=f"{ctx.author}: {reason}")
+    e = _chan_embed("🔒", "تم قفل الروم", ch, ctx.author, reason, C_ERR)
+    await ctx.send(embed=e)
+    await modlog(ctx.guild, e)
+
+@bot.hybrid_command(name="unlock", aliases=["فتح"], description="فتح الروم")
+@commands.has_permissions(manage_channels=True)
+@commands.bot_has_permissions(manage_channels=True)
+@commands.guild_only()
+async def unlock(ctx, channel: Optional[discord.TextChannel] = None, *, reason: str = "بدون سبب"):
+    ch = channel or ctx.channel
+    ow = ch.overwrites_for(ctx.guild.default_role)
+    if ow.send_messages is not False:
+        return await send_err(ctx, f"{ch.mention} مو مقفل.", "الروم مفتوح أصلاً")
+    ow.send_messages = None
+    await ch.set_permissions(ctx.guild.default_role, overwrite=ow, reason=f"{ctx.author}: {reason}")
+    e = _chan_embed("🔓", "تم فتح الروم", ch, ctx.author, reason, C_OK)
+    await ctx.send(embed=e)
+    await modlog(ctx.guild, e)
+
+@bot.hybrid_command(name="hide", aliases=["اخفاء", "إخفاء"], description="إخفاء الروم عن الجميع")
+@commands.has_permissions(manage_channels=True)
+@commands.bot_has_permissions(manage_channels=True)
+@commands.guild_only()
+async def hide(ctx, channel: Optional[discord.TextChannel] = None, *, reason: str = "بدون سبب"):
+    ch = channel or ctx.channel
+    ow = ch.overwrites_for(ctx.guild.default_role)
+    if ow.view_channel is False:
+        return await send_err(ctx, f"{ch.mention} مخفي من قبل.", "الروم مخفي أصلاً")
+    ow.view_channel = False
+    await ch.set_permissions(ctx.guild.default_role, overwrite=ow, reason=f"{ctx.author}: {reason}")
+    e = _chan_embed("🙈", "تم إخفاء الروم", ch, ctx.author, reason, C_WARN)
+    try:
+        await ctx.send(embed=e)
+    except discord.HTTPException:
+        pass
+    await modlog(ctx.guild, e)
+
+@bot.hybrid_command(name="unhide", aliases=["اظهار", "إظهار"], description="إظهار الروم")
+@commands.has_permissions(manage_channels=True)
+@commands.bot_has_permissions(manage_channels=True)
+@commands.guild_only()
+async def unhide(ctx, channel: Optional[discord.TextChannel] = None, *, reason: str = "بدون سبب"):
+    ch = channel or ctx.channel
+    ow = ch.overwrites_for(ctx.guild.default_role)
+    if ow.view_channel is not False:
+        return await send_err(ctx, f"{ch.mention} ظاهر أصلاً.", "الروم ظاهر أصلاً")
+    ow.view_channel = None
+    await ch.set_permissions(ctx.guild.default_role, overwrite=ow, reason=f"{ctx.author}: {reason}")
+    e = _chan_embed("👁️", "تم إظهار الروم", ch, ctx.author, reason, C_OK)
+    await ctx.send(embed=e)
+    await modlog(ctx.guild, e)
+
+@bot.hybrid_command(name="slowmode", aliases=["سلو", "بطيء"], description="وضع البطيء بالثواني (0 للإلغاء)")
+@commands.has_permissions(manage_channels=True)
+@commands.bot_has_permissions(manage_channels=True)
+@commands.guild_only()
+async def slowmode(ctx, seconds: int):
+    if not 0 <= seconds <= 21600:
+        return await send_err(ctx, "من 0 إلى 21600 ثانية.", "رقم غير صحيح")
+    await ctx.channel.edit(slowmode_delay=seconds)
+    if seconds:
+        e = fancy("🐢 تم تفعيل الوضع البطيء", color=C_WARN)
+        e.add_field(name="⏱️ المدة", value=f"**{seconds}** ثانية")
+    else:
+        e = ok_e("تم إلغاء الوضع البطيء")
+    e.add_field(name="💬 الروم", value=ctx.channel.mention)
+    e.add_field(name="🛡️ بواسطة", value=ctx.author.mention)
+    await ctx.send(embed=e)
+
+@bot.hybrid_command(name="nick", aliases=["لقب"], description="تغيير لقب عضو")
+@commands.has_permissions(manage_nicknames=True)
+@commands.bot_has_permissions(manage_nicknames=True)
+@commands.guild_only()
+async def nick(ctx, member: discord.Member, *, nickname: str = None):
+    err = can_act(ctx, member) if member != ctx.author else None
+    if err:
+        return await send_err(ctx, err)
+    old = member.display_name
+    await member.edit(nick=nickname, reason=f"{ctx.author}")
+    e = ok_e("تم تغيير اللقب")
+    e.set_thumbnail(url=member.display_avatar.url)
+    e.add_field(name="👤 العضو", value=member.mention)
+    e.add_field(name="قبل", value=old)
+    e.add_field(name="بعد", value=nickname or "الاسم الأصلي")
+    await ctx.send(embed=e)
+
+def _role_err(ctx, role: discord.Role) -> str | None:
+    if role.managed or role == ctx.guild.default_role:
+        return "هذي الرتبة ما تنعطى يدوياً."
+    if role >= ctx.guild.me.top_role or (role >= ctx.author.top_role and ctx.author != ctx.guild.owner):
+        return "هذي الرتبة أعلى من رتبتك أو رتبة البوت."
+    return None
+
+@bot.hybrid_command(name="addrole", aliases=["اعطاء_رتبة"], description="إعطاء رتبة لعضو")
+@commands.has_permissions(manage_roles=True)
+@commands.bot_has_permissions(manage_roles=True)
+@commands.guild_only()
+async def addrole(ctx, member: discord.Member, role: discord.Role):
+    err = _role_err(ctx, role)
+    if err:
+        return await send_err(ctx, err)
+    if role in member.roles:
+        return await send_err(ctx, f"{member.mention} عنده {role.mention} من قبل.", "الرتبة موجودة")
+    await member.add_roles(role, reason=f"{ctx.author}")
+    e = ok_e("تمت إضافة الرتبة")
+    e.set_thumbnail(url=member.display_avatar.url)
+    e.add_field(name="👤 العضو", value=member.mention)
+    e.add_field(name="🎭 الرتبة", value=role.mention)
+    e.add_field(name="🛡️ بواسطة", value=ctx.author.mention)
+    await ctx.send(embed=e)
+
+@bot.hybrid_command(name="removerole", aliases=["سحب_رتبة"], description="سحب رتبة من عضو")
+@commands.has_permissions(manage_roles=True)
+@commands.bot_has_permissions(manage_roles=True)
+@commands.guild_only()
+async def removerole(ctx, member: discord.Member, role: discord.Role):
+    err = _role_err(ctx, role)
+    if err:
+        return await send_err(ctx, err)
+    if role not in member.roles:
+        return await send_err(ctx, f"{member.mention} ما عنده {role.mention}.", "الرتبة مو موجودة")
+    await member.remove_roles(role, reason=f"{ctx.author}")
+    e = ok_e("تم سحب الرتبة")
+    e.set_thumbnail(url=member.display_avatar.url)
+    e.add_field(name="👤 العضو", value=member.mention)
+    e.add_field(name="🎭 الرتبة", value=role.mention)
+    e.add_field(name="🛡️ بواسطة", value=ctx.author.mention)
+    await ctx.send(embed=e)
+
+@bot.hybrid_command(name="nuke", aliases=["تنظيف"], description="مسح كل رسائل الروم (يعيد إنشاءه)")
+@commands.has_permissions(administrator=True)
+@commands.bot_has_permissions(manage_channels=True)
+@commands.guild_only()
+async def nuke(ctx):
+    ch = ctx.channel
+    if str(ch.id) in conf(ctx.guild.id)["tickets"]:
+        return await send_err(ctx, "ما تقدر تسوي nuke لروم تذكرة. استخدم أمر الإغلاق.", "روم تذكرة")
+    view = ConfirmView(ctx.author.id)
+    msg = await ctx.send(embed=warn_e("تأكيد التنظيف",
+                                      f"راح تنحذف **كل** رسائل {ch.mention} ويُعاد إنشاء الروم.\nما ينفع التراجع!"),
+                         view=view)
+    await view.wait()
+    if not view.value:
+        return await msg.edit(embed=err_e("تم إلغاء العملية.", "ملغي"), view=None)
+    await msg.edit(embed=info_e("💥 جاري التنظيف..."), view=None)
+    new = await ch.clone(reason=f"Nuke by {ctx.author}")
+    await new.edit(position=ch.position)
+    await ch.delete()
+    e = fancy("💥 تم تنظيف الروم", color=C_OK)
+    e.add_field(name="🛡️ بواسطة", value=ctx.author.mention)
+    await new.send(embed=e)
+
+# ---------------------------------------------------------------- إعدادات الترحيب
+@bot.hybrid_command(name="setwelcome", description="تحديد روم الترحيب")
+@commands.has_permissions(manage_guild=True)
+async def setwelcome(ctx, channel: discord.TextChannel):
+    conf(ctx.guild.id)["welcome"]["channel"] = channel.id
+    save_data()
+    await ctx.send(embed=embed("✅ روم الترحيب", channel.mention))
+
+@bot.hybrid_command(name="welcomeset", description="تعديل نص الترحيب (المتغيرات: {user} {name} {server} {count})")
+@commands.has_permissions(manage_guild=True)
+async def welcomeset(ctx, item: Literal["title", "desc", "footer", "color", "content", "author"], *, value: str):
+    """title=العنوان الكبير | desc=النص (المتغيرات: {username} {inviter} {number} {date} {user} {name} {server} {count}) | footer=السطر الأخير | color=لون الخط الجانبي | content/author=للتصميم الكلاسيكي فقط"""
+    w = conf(ctx.guild.id)["welcome"]
+    if item == "color":
+        if not valid_color(value):
+            return await ctx.send("❌ اللون لازم يكون HEX مثل `E8352A`.")
+        w["color"] = value.strip().lstrip("#")
+    else:
+        w[item] = nl(value)
+    save_data()
+    await ctx.send(embed=embed("✅ تم الحفظ", f"**{item}** ← {value}\nجرّب `{PREFIX}testwelcome`"))
+
+@bot.hybrid_command(name="welcomeimage", description="تغيير الصورة السفلية للترحيب (صورة مرفقة أو رابط)")
+@commands.has_permissions(manage_guild=True)
+async def welcomeimage(ctx, image: discord.Attachment = None, url: str = None):
+    if image is None and url and url.strip().lower() in ("off", "none", "-", "بدون", "لا"):
+        conf(ctx.guild.id)["welcome"]["image"] = None
+        save_data()
+        return await ctx.send(embed=embed("✅ تمت إزالة صورة الترحيب"))
+    try:
+        conf(ctx.guild.id)["welcome"]["image"] = await store_image(ctx.guild.id, "welcome", image, url)
+    except ValueError as err:
+        return await ctx.send(f"❌ {err}")
+    save_data()
+    await ctx.send(embed=embed("✅ تم تغيير صورة الترحيب", f"جرّب `{PREFIX}testwelcome`"))
+
+@bot.hybrid_command(name="welcomethumb", description="إظهار/إخفاء صورة العضو الصغيرة")
+@commands.has_permissions(manage_guild=True)
+async def welcomethumb(ctx, enabled: bool):
+    conf(ctx.guild.id)["welcome"]["thumb"] = enabled
+    save_data()
+    await ctx.send(embed=embed("✅ تم", "تظهر" if enabled else "مخفية"))
+
+@bot.hybrid_command(name="welcomebanner", description="الشريط السفلي تحت بطاقة الترحيب (صورة مرفقة أو رابط — اكتب off للإزالة)")
+@commands.has_permissions(manage_guild=True)
+async def welcomebanner(ctx, image: discord.Attachment = None, url: str = None):
+    if image is None and url and url.strip().lower() in ("off", "none", "-", "بدون", "لا"):
+        conf(ctx.guild.id)["welcome"]["banner"] = None
+        save_data()
+        return await ctx.send(embed=embed("✅ تمت إزالة الشريط السفلي"))
+    try:
+        conf(ctx.guild.id)["welcome"]["banner"] = await store_image(ctx.guild.id, "welcomebanner", image, url)
+    except ValueError as err:
+        return await ctx.send(f"❌ {err}")
+    save_data()
+    await ctx.send(embed=embed("✅ تم تغيير الشريط السفلي", f"جرّب `{PREFIX}testwelcome`"))
+
+@bot.hybrid_command(name="welcomestyle", description="شكل الترحيب: modern (الجديد) أو classic (الإيمبد القديم)")
+@commands.has_permissions(manage_guild=True)
+async def welcomestyle(ctx, style: Literal["modern", "classic"]):
+    conf(ctx.guild.id)["welcome"]["style"] = style
+    save_data()
+    await ctx.send(embed=embed("✅ تم", f"شكل الترحيب: **{style}**\nجرّب `{PREFIX}testwelcome`"))
+
+@bot.hybrid_command(name="welcomereset", description="إرجاع نص الترحيب للتصميم الجديد الافتراضي")
+@commands.has_permissions(manage_guild=True)
+async def welcomereset(ctx):
+    w = conf(ctx.guild.id)["welcome"]
+    w.update(title="Welcome", desc=WELCOME_DESC, footer="{date}", style="modern")
+    save_data()
+    await ctx.send(embed=embed("✅ تم إرجاع التصميم الافتراضي", f"جرّب `{PREFIX}testwelcome`"))
+
+@bot.hybrid_command(name="testwelcome", description="تجربة رسالة الترحيب")
+@commands.has_permissions(manage_guild=True)
+async def testwelcome(ctx):
+    await send_welcome(ctx, ctx.author, ctx.author.id)
+
+@bot.hybrid_command(name="setleave", description="تحديد روم المغادرة")
+@commands.has_permissions(manage_guild=True)
+async def setleave(ctx, channel: discord.TextChannel):
+    conf(ctx.guild.id)["leave"]["channel"] = channel.id
+    save_data()
+    await ctx.send(embed=embed("✅ روم المغادرة", channel.mention))
+
+@bot.hybrid_command(name="leavemsg", description="تغيير رسالة المغادرة")
+@commands.has_permissions(manage_guild=True)
+async def leavemsg(ctx, *, message: str):
+    conf(ctx.guild.id)["leave"]["msg"] = nl(message)
+    save_data()
+    await ctx.send(embed=embed("✅ تم حفظ رسالة المغادرة", message))
+
+@bot.hybrid_command(name="autorole", description="رتبة تلقائية للأعضاء الجدد")
+@commands.has_permissions(manage_guild=True)
+async def autorole(ctx, role: discord.Role = None):
+    conf(ctx.guild.id)["autorole"] = role.id if role else None
+    save_data()
+    await ctx.send(embed=embed("✅ الرتبة التلقائية", role.mention if role else "تم الإلغاء"))
+
+# ---------------------------------------------------------------- نظام التذاكر
+def is_staff(member: discord.Member, info: dict | None = None) -> bool:
+    if member.guild_permissions.manage_channels:
+        return True
+    role_id = (info or {}).get("role")
+    return bool(role_id) and any(r.id == role_id for r in member.roles)
+
+async def ticket_log(guild: discord.Guild, e: discord.Embed, file: discord.File = None):
+    cid = conf(guild.id)["ticket"]["log_channel"]
+    ch = guild.get_channel(cid) if cid else None
+    if ch:
+        try:
+            await ch.send(embed=e, file=file)
+        except discord.Forbidden:
+            pass
+
+async def build_transcript(channel: discord.TextChannel) -> bytes:
+    lines = []
+    async for m in channel.history(limit=None, oldest_first=True):
+        content = m.content or ""
+        if m.attachments:
+            content += " " + " ".join(a.url for a in m.attachments)
+        lines.append(f"[{m.created_at:%Y-%m-%d %H:%M}] {m.author} : {content}")
+    return ("\n".join(lines) or "لا توجد رسائل").encode("utf-8")
+
+class RatingView(discord.ui.View):
+    """تقييم الدعم — يوصل لصاحب التذكرة في الخاص بعد الإغلاق."""
+    def __init__(self, guild: discord.Guild, ticket_name: str, staff_id):
+        super().__init__(timeout=86400)
+        self.guild, self.ticket_name, self.staff_id = guild, ticket_name, staff_id
+
+    @discord.ui.select(placeholder="⭐ قيّم الدعم", options=[
+        discord.SelectOption(label=f"{i} من 5", value=str(i), emoji="⭐") for i in range(5, 0, -1)])
+    async def rate(self, interaction: discord.Interaction, select: discord.ui.Select):
+        n = int(select.values[0])
+        if self.staff_id:
+            record_rating(self.guild.id, self.staff_id, n)
+        e = embed("⭐ تقييم جديد", color=0xFFD700)
+        e.add_field(name="التذكرة", value=self.ticket_name)
+        e.add_field(name="التقييم", value="⭐" * n)
+        e.add_field(name="المقيّم", value=interaction.user.mention)
+        if self.staff_id:
+            e.add_field(name="المستلم", value=f"<@{self.staff_id}>")
+        await ticket_log(self.guild, e)
+        await interaction.response.edit_message(content="شكراً لتقييمك 💙", view=None)
+
+async def close_ticket(channel: discord.TextChannel, closer: discord.Member, reason: str = None):
+    guild = channel.guild
+    c = conf(guild.id)
+    info = c["tickets"].get(str(channel.id))
+    if not info:
+        return
+    data = await build_transcript(channel)
+    owner = guild.get_member(info["owner"])
+
+    # نقاط المستلم — تنحسب تلقائياً عند الإغلاق
+    earned = 0
+    claimer = info.get("claimed")
+    if claimer and claimer != info["owner"]:
+        earned = c["ticket"]["point_value"]
+        award_points(guild.id, claimer, earned)
+
+    e = embed("🔒 تذكرة مغلقة", color=0xFF5555)
+    e.add_field(name="التذكرة", value=channel.name)
+    e.add_field(name="النوع", value=info.get("type", "—"))
+    e.add_field(name="صاحبها", value=f"<@{info['owner']}>")
+    e.add_field(name="أغلقها", value=closer.mention)
+    e.add_field(name="استلمها", value=f"<@{info['claimed']}>" if info.get("claimed") else "لا أحد")
+    if earned:
+        e.add_field(name="🏆 النقاط", value=f"<@{claimer}> **+{earned}**")
+    e.add_field(name="فُتحت", value=discord.utils.format_dt(datetime.datetime.fromisoformat(info["opened"]), "f"))
+    if info.get("reason"):
+        e.add_field(name="سبب الفتح", value=info["reason"][:300], inline=False)
+    if reason:
+        e.add_field(name="سبب الإغلاق", value=reason[:300], inline=False)
+    await ticket_log(guild, e, discord.File(io.BytesIO(data), filename=f"{channel.name}.txt"))
+
+    if owner:
+        try:
+            await owner.send(f"🔒 تم إغلاق تذكرتك في **{guild.name}**."
+                             + (f"\nالسبب: {reason}" if reason else "") + "\nهذا سجل المحادثة:",
+                             file=discord.File(io.BytesIO(data), filename=f"{channel.name}.txt"))
+            await owner.send("كيف كانت تجربتك مع الدعم؟",
+                             view=RatingView(guild, channel.name, info.get("claimed")))
+        except discord.Forbidden:
+            pass
+
+    c["tickets"].pop(str(channel.id), None)
+    save_data()
+    await asyncio.sleep(3)
+    await channel.delete(reason=f"Ticket closed by {closer}")
+
+# ---------- رسالة التحكم داخل التذكرة (قابلة للتخصيص بالكامل)
+def fmt_ticket(text: str, user, channel, info: dict, support) -> str:
+    claimed = f"<@{info['claimed']}>" if info.get("claimed") else "لا أحد"
+    opened = datetime.datetime.fromisoformat(info["opened"])
+    return ((text or "")
+            .replace("{user}", user.mention)
+            .replace("{name}", user.name)
+            .replace("{server}", user.guild.name)
+            .replace("{date}", discord.utils.format_dt(opened, "F"))
+            .replace("{reason}", info.get("reason") or "—")
+            .replace("{type}", info.get("type", "—"))
+            .replace("{ticket}", channel.mention)
+            .replace("{support}", support.mention if support else "")
+            .replace("{claimed}", claimed))
+
+def build_inside(guild: discord.Guild, user: discord.Member, channel, info: dict):
+    ins = conf(guild.id)["inside"]
+    support = guild.get_role(info["role"]) if info.get("role") else None
+    ft = lambda s: fmt_ticket(s, user, channel, info, support)
+    e = discord.Embed(description=ft(ins["desc"]), color=parse_color(ins["color"]))
+    if ins["author"]:
+        e.set_author(name=ft(ins["author"]), icon_url=ins["author_icon"] or None)
+    if ins["thumb"]:
+        e.set_thumbnail(url=user.display_avatar.url)
+    if ins["footer"]:
+        e.set_footer(text=ft(ins["footer"]))
+    f = apply_image(e, ins["image"], "ticketinside")
+    return (ft(ins["content"]).strip() or None), e, f
+
+async def open_ticket(interaction: discord.Interaction, key: str, reason: str):
+    guild, user = interaction.guild, interaction.user
+    c = conf(guild.id)
+    t = c["ticket"]["types"].get(key)
+    if not t:
+        return await interaction.response.send_message("❌ هذا النوع انحذف.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    category = guild.get_channel(t["category"]) if t.get("category") else None
+    support = guild.get_role(t["role"]) if t.get("role") else None
+    ow = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        user: discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                          attach_files=True, read_message_history=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                              manage_channels=True, read_message_history=True),
+    }
+    if support:
+        ow[support] = discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                                  attach_files=True, read_message_history=True)
+    c["ticket"]["counter"] += 1
+    slug = re.sub(r"[^a-z0-9]+", "-", t["label"].lower()).strip("-") or "ticket"
+    channel = await guild.create_text_channel(
+        f"{slug}-{c['ticket']['counter']:04d}", category=category, overwrites=ow,
+        topic=f"{t['label']} — {user} ({user.id})")
+    info = {
+        "owner": user.id, "claimed": None, "type": t["label"], "role": t.get("role"),
+        "reason": reason, "priority": "normal",
+        "opened": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+    c["tickets"][str(channel.id)] = info
+    save_data()
+
+    content, e, f = build_inside(guild, user, channel, info)
+    msg = await channel.send(content=content, embed=e, file=f, view=TicketControls(guild.id))
+    info["msg"] = msg.id
+    save_data()
+    try:
+        await msg.pin()
+    except discord.HTTPException:
+        pass
+    await interaction.followup.send(f"✅ تم فتح تذكرتك: {channel.mention}", ephemeral=True)
+
+    le = embed("🎫 تذكرة جديدة", color=0x55FF88)
+    le.add_field(name="التذكرة", value=channel.mention)
+    le.add_field(name="النوع", value=t["label"])
+    le.add_field(name="صاحبها", value=user.mention)
+    le.add_field(name="السبب", value=reason[:300], inline=False)
+    await ticket_log(guild, le)
+
+class ReasonModal(discord.ui.Modal):
+    def __init__(self, key: str):
+        super().__init__(title="سبب التذكرة")
+        self.key = key
+        self.reason = discord.ui.TextInput(label="اكتب سبب فتح التذكرة",
+                                           style=discord.TextStyle.paragraph,
+                                           max_length=1000, required=True)
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await open_ticket(interaction, self.key, str(self.reason))
+
+class TicketButton(discord.ui.DynamicItem[discord.ui.Button], template=r"taqat:tk:(?P<key>[0-9]+)"):
+    """زر فتح تذكرة — كل نوع تذكرة له زر، ويشتغل حتى بعد إعادة تشغيل البوت."""
+
+    def __init__(self, key: str, label: str = None, emoji: str = None,
+                 style: discord.ButtonStyle = discord.ButtonStyle.secondary):
+        super().__init__(discord.ui.Button(label=label, emoji=emoji, style=style,
+                                           custom_id=f"taqat:tk:{key}"))
+        self.key = key
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["key"])
+
+    async def callback(self, interaction: discord.Interaction):
+        guild, user = interaction.guild, interaction.user
+        c = conf(guild.id)
+        t = c["ticket"]["types"].get(self.key)
+        if not t:
+            return await interaction.response.send_message("❌ هذا النوع انحذف.", ephemeral=True)
+
+        if user.id in c["ticket"]["blacklist"]:
+            return await interaction.response.send_message(
+                "❌ أنت ممنوع من فتح التذاكر.", ephemeral=True)
+
+        mine = [cid for cid, i in c["tickets"].items()
+                if i["owner"] == user.id and guild.get_channel(int(cid))]
+        if len(mine) >= c["ticket"]["max"]:
+            return await interaction.response.send_message(
+                f"❌ عندك تذكرة مفتوحة: <#{mine[0]}>", ephemeral=True)
+
+        if c["inside"]["ask_reason"]:
+            return await interaction.response.send_modal(ReasonModal(self.key))
+        await open_ticket(interaction, self.key, "لم يُذكر سبب")
+
+# ---------- دوال مشتركة بين الأزرار والأوامر
+async def claim_ticket(channel, user: discord.Member, info: dict) -> str | None:
+    if info.get("claimed"):
+        return f"مستلمها <@{info['claimed']}>"
+    info["claimed"] = user.id
+    save_data()
+    await channel.send(embed=embed(None, f"تم استلام التذكرة من قبل {user.mention} ✅", 0x3DDC84))
+    await refresh_controls(channel, info)
+    le = embed("🙋 استلام تذكرة", color=0xFFAA00)
+    le.add_field(name="التذكرة", value=channel.mention)
+    le.add_field(name="المستلم", value=user.mention)
+    await ticket_log(channel.guild, le)
+    return None
+
+async def unclaim_ticket(channel, user: discord.Member, info: dict):
+    info["claimed"] = None
+    save_data()
+    await channel.send(embed=embed("↩️ إلغاء الاستلام", f"{user.mention} حرر التذكرة."))
+    await refresh_controls(channel, info)
+
+async def refresh_controls(channel, info: dict):
+    """يحدّث رسالة التحكم (الأزرار + المحتوى) بعد استلام / تحويل."""
+    guild = channel.guild
+    msg = None
+    try:
+        if info.get("msg"):
+            msg = await channel.fetch_message(info["msg"])
+        else:
+            async for m in channel.history(limit=50, oldest_first=True):
+                if m.author.id == guild.me.id and m.components:
+                    msg = m
+                    info["msg"] = m.id
+                    save_data()
+                    break
+    except discord.HTTPException:
+        return
+    if not msg:
+        return
+    claimed = bool(info.get("claimed"))
+    owner = guild.get_member(info["owner"])
+    try:
+        if owner:
+            content, e, f = build_inside(guild, owner, channel, info)
+            kw = {"content": content, "embed": e, "view": TicketControls(guild.id, claimed)}
+            if f:
+                kw["attachments"] = [f]
+            await msg.edit(**kw)
+        else:
+            await msg.edit(view=TicketControls(guild.id, claimed))
+    except discord.HTTPException:
+        pass
+
+async def set_priority(channel, info: dict, level: str):
+    emoji, name = PRIORITIES[level]
+    info["priority"] = level
+    save_data()
+    base = re.sub(r"^(?:🟢|🟡|🟠|🔴)-", "", channel.name)
+    new = base if level == "normal" else f"{emoji}-{base}"
+    try:
+        await channel.edit(name=new)
+    except discord.HTTPException:
+        pass
+    await channel.send(embed=embed("🚦 أولوية التذكرة", f"{emoji} **{name}**"))
+    return emoji, name
+
+async def set_lock(channel, info: dict, locked: bool):
+    owner = channel.guild.get_member(info["owner"])
+    if owner:
+        await channel.set_permissions(owner, view_channel=True, read_message_history=True,
+                                      attach_files=not locked,
+                                      send_messages=False if locked else True)
+    await channel.send(embed=embed("🔒 تم قفل التذكرة" if locked else "🔓 تم فتح التذكرة",
+                                   "صاحب التذكرة ما يقدر يكتب." if locked else "صاحب التذكرة يقدر يكتب."))
+
+def info_embed(channel, info: dict) -> discord.Embed:
+    emoji, pname = PRIORITIES.get(info.get("priority", "normal"), PRIORITIES["normal"])
+    e = embed("ℹ️ معلومات التذكرة")
+    e.add_field(name="التذكرة", value=channel.mention)
+    e.add_field(name="النوع", value=info.get("type", "—"))
+    e.add_field(name="صاحبها", value=f"<@{info['owner']}>")
+    e.add_field(name="المستلم", value=f"<@{info['claimed']}>" if info.get("claimed") else "لا أحد")
+    e.add_field(name="الأولوية", value=f"{emoji} {pname}")
+    e.add_field(name="فُتحت", value=discord.utils.format_dt(datetime.datetime.fromisoformat(info["opened"]), "R"))
+    e.add_field(name="السبب", value=(info.get("reason") or "—")[:500], inline=False)
+    return e
+
+# ---------- المودالات والقوائم (إجراءات أخرى)
+class RenameModal(discord.ui.Modal, title="إعادة تسمية التذكرة"):
+    name = discord.ui.TextInput(label="الاسم الجديد", max_length=90)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        new = re.sub(r"\s+", "-", str(self.name).strip().lower())
+        try:
+            await interaction.channel.edit(name=new)
+        except discord.HTTPException:
+            return await interaction.response.send_message("❌ ما قدرت أغيّر الاسم.", ephemeral=True)
+        await interaction.response.send_message(embed=embed("✏️ تمت إعادة التسمية", new))
+
+class NoteModal(discord.ui.Modal, title="ملاحظة داخلية للفريق"):
+    note = discord.ui.TextInput(label="الملاحظة (تنرسل للوق فقط)",
+                                style=discord.TextStyle.paragraph, max_length=1000)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        le = embed("🗒️ ملاحظة على تذكرة", str(self.note), 0x8888FF)
+        le.add_field(name="التذكرة", value=interaction.channel.mention)
+        le.add_field(name="بواسطة", value=interaction.user.mention)
+        await ticket_log(interaction.guild, le)
+        await interaction.response.send_message("✅ انحفظت الملاحظة في اللوق.", ephemeral=True)
+
+class CloseModal(discord.ui.Modal, title="إغلاق التذكرة"):
+    reason = discord.ui.TextInput(label="سبب الإغلاق", style=discord.TextStyle.paragraph,
+                                  max_length=300, required=False)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.send_message("🔒 جاري الإغلاق وحفظ السجل...")
+        await close_ticket(interaction.channel, interaction.user, str(self.reason) or None)
+
+class PriorityView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+
+    @discord.ui.select(placeholder="اختر الأولوية", options=[
+        discord.SelectOption(label=name, value=k, emoji=emoji)
+        for k, (emoji, name) in PRIORITIES.items()])
+    async def pick(self, interaction: discord.Interaction, select: discord.ui.Select):
+        info = conf(interaction.guild.id)["tickets"].get(str(interaction.channel.id))
+        if not info:
+            return await interaction.response.edit_message(content="❌ هذي مو تذكرة.", view=None)
+        await interaction.response.edit_message(content="✅ تم تحديث الأولوية.", view=None)
+        await set_priority(interaction.channel, info, select.values[0])
+
+class PickUserView(discord.ui.View):
+    def __init__(self, action: str):
+        super().__init__(timeout=120)
+        self.action = action
+
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="اختر العضو")
+    async def pick(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+        member = select.values[0]
+        if not isinstance(member, discord.Member):
+            member = interaction.guild.get_member(member.id)
+        if not member:
+            return await interaction.response.edit_message(content="❌ العضو مو بالسيرفر.", view=None)
+        ch = interaction.channel
+        info = conf(interaction.guild.id)["tickets"].get(str(ch.id))
+        if not info:
+            return await interaction.response.edit_message(content="❌ هذي مو تذكرة.", view=None)
+
+        if self.action == "add":
+            await ch.set_permissions(member, view_channel=True, send_messages=True,
+                                     attach_files=True, read_message_history=True)
+            note = embed("➕ تمت الإضافة", member.mention)
+        elif self.action == "remove":
+            if member.id == info["owner"]:
+                return await interaction.response.edit_message(content="❌ ما تقدر تشيل صاحب التذكرة.", view=None)
+            await ch.set_permissions(member, overwrite=None)
+            note = embed("➖ تمت الإزالة", member.mention)
+        else:  # transfer
+            if not is_staff(member, info):
+                return await interaction.response.edit_message(content="❌ هذا العضو مو من الفريق.", view=None)
+            info["claimed"] = member.id
+            save_data()
+            note = embed("🔁 تحويل الاستلام", f"{member.mention} صار هو المستلم.")
+        await interaction.response.edit_message(content="✅ تم.", view=None)
+        await ch.send(embed=note)
+
+class ScheduleModal(discord.ui.Modal, title="إغلاق مجدول"):
+    when = discord.ui.TextInput(label="بعد كم؟ مثال: 30m أو 2h أو 1d (0 للإلغاء)", max_length=10)
+    reason = discord.ui.TextInput(label="السبب (اختياري)", style=discord.TextStyle.paragraph,
+                                  max_length=200, required=False)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        info = conf(interaction.guild.id)["tickets"].get(str(interaction.channel.id))
+        if not info:
+            return await interaction.response.send_message("❌ هذي مو تذكرة.", ephemeral=True)
+        val = str(self.when).strip().lower()
+        if val in ("0", "الغاء", "إلغاء", "cancel"):
+            if not info.get("close_at"):
+                return await interaction.response.send_message("❌ ما فيه إغلاق مجدول.", ephemeral=True)
+            for k in ("close_at", "close_reason", "close_by"):
+                info.pop(k, None)
+            save_data()
+            return await interaction.response.send_message(
+                embed=embed("✅ تم إلغاء الإغلاق المجدول", f"بواسطة {interaction.user.mention}", 0x3DDC84))
+        mins = parse_duration(val)
+        if mins is None or not 1 <= mins <= 10080:
+            return await interaction.response.send_message(
+                "❌ مدة غير صحيحة. أمثلة: `30m` `2h` `1d` (حد أقصى 7 أيام).", ephemeral=True)
+        at = discord.utils.utcnow() + datetime.timedelta(minutes=mins)
+        info["close_at"] = at.isoformat()
+        info["close_reason"] = str(self.reason) or None
+        info["close_by"] = interaction.user.id
+        save_data()
+        e = embed("⏰ إغلاق مجدول", f"راح تنغلق هذي التذكرة {discord.utils.format_dt(at, 'R')}", 0xFFAA00)
+        e.add_field(name="بواسطة", value=interaction.user.mention)
+        if info["close_reason"]:
+            e.add_field(name="السبب", value=info["close_reason"], inline=False)
+        e.set_footer(text="لإلغائه: إجراءات أخرى ← إغلاق مجدول ← اكتب 0")
+        await interaction.response.send_message(embed=e)
+
+class MoveView(discord.ui.View):
+    """اختيار القسم الجديد لتحويل التذكرة."""
+    def __init__(self, guild: discord.Guild, current_label: str):
+        super().__init__(timeout=120)
+        types = conf(guild.id)["ticket"]["types"]
+        options = [discord.SelectOption(label=t["label"][:100], value=k, emoji=t.get("emoji") or None)
+                   for k, t in types.items() if t["label"] != current_label][:25]
+        self.select = discord.ui.Select(placeholder="🔀 اختر القسم الجديد", options=options)
+        self.select.callback = self.on_pick
+        self.add_item(self.select)
+
+    async def on_pick(self, interaction: discord.Interaction):
+        info = conf(interaction.guild.id)["tickets"].get(str(interaction.channel.id))
+        if not info:
+            return await interaction.response.edit_message(content="❌ هذي مو تذكرة.", view=None)
+        await interaction.response.edit_message(content="✅ جاري التحويل...", view=None)
+        await move_ticket(interaction.channel, info, self.select.values[0], interaction.user)
+
+STAFF_OPTS = [
+    ("add", "إضافة عضو", "➕", "إضافة شخص للتذكرة"),
+    ("remove", "إزالة عضو", "➖", "إزالة شخص من التذكرة"),
+    ("rename", "إعادة تسمية", "✏️", "تغيير اسم روم التذكرة"),
+    ("schedule", "إغلاق مجدول", "⏰", "إغلاق التذكرة بعد مدة"),
+    ("ping_owner", "تذكير", "🔔", "منشن + رسالة خاصة لصاحب التذكرة"),
+    ("move", "تحويل التذكرة", "🔀", "نقل التذكرة لقسم ثاني"),
+    ("transfer", "تحويل الاستلام", "🔁", "تحويل التذكرة لعضو من الفريق"),
+    ("unclaim", "إلغاء الاستلام", "↩️", "تحرير التذكرة ليستلمها غيرك"),
+    ("priority", "تغيير الأولوية", "🚦", "منخفضة / عادية / عالية / عاجلة"),
+    ("lock", "قفل الكتابة", "🔒", "منع صاحب التذكرة من الكتابة"),
+    ("unlock", "فتح الكتابة", "🔓", "السماح لصاحب التذكرة بالكتابة"),
+    ("note", "ملاحظة داخلية", "🗒️", "تنحفظ في اللوق فقط"),
+    ("transcript", "سجل المحادثة", "📜", "ملف نصي بكل الرسائل"),
+    ("info", "معلومات التذكرة", "ℹ️", "تفاصيل التذكرة"),
+    ("close_reason", "إغلاق مع سبب", "🔐", "يوصل السبب لصاحب التذكرة"),
+]
+OWNER_OPTS = [
+    ("ping_staff", "استدعاء الفريق", "🔔", "منشن لرتبة الدعم"),
+    ("transcript", "سجل المحادثة", "📜", "ملف نصي بكل الرسائل"),
+    ("info", "معلومات التذكرة", "ℹ️", "تفاصيل التذكرة"),
+    ("close_reason", "إغلاق مع سبب", "🔐", "إغلاق التذكرة"),
+]
+OWNER_ALLOWED = {o[0] for o in OWNER_OPTS}
+
+async def handle_action(interaction: discord.Interaction, action: str):
+    guild, ch, user = interaction.guild, interaction.channel, interaction.user
+    info = conf(guild.id)["tickets"].get(str(ch.id))
+    if not info:
+        return await interaction.response.edit_message(content="❌ هذي مو تذكرة.", view=None)
+    staff = is_staff(user, info)
+    if not staff and not (user.id == info["owner"] and action in OWNER_ALLOWED):
+        return await interaction.response.edit_message(content="❌ ما عندك صلاحية.", view=None)
+
+    if action in ("add", "remove", "transfer"):
+        return await interaction.response.edit_message(content="👤 اختر العضو:", view=PickUserView(action))
+    if action == "rename":
+        return await interaction.response.send_modal(RenameModal())
+    if action == "note":
+        return await interaction.response.send_modal(NoteModal())
+    if action == "close_reason":
+        return await interaction.response.send_modal(CloseModal())
+    if action == "priority":
+        return await interaction.response.edit_message(content="🚦 اختر الأولوية:", view=PriorityView())
+    if action == "schedule":
+        return await interaction.response.send_modal(ScheduleModal())
+    if action == "move":
+        others = [t for t in conf(guild.id)["ticket"]["types"].values() if t["label"] != info.get("type")]
+        if not others:
+            return await interaction.response.edit_message(content="❌ ما فيه أقسام ثانية للتحويل.", view=None)
+        return await interaction.response.edit_message(
+            content="🔀 اختر القسم الجديد:", view=MoveView(guild, info.get("type")))
+
+    if action in ("lock", "unlock"):
+        await interaction.response.edit_message(content="✅ تم.", view=None)
+        return await set_lock(ch, info, action == "lock")
+    if action == "unclaim":
+        if not info.get("claimed"):
+            return await interaction.response.edit_message(content="❌ التذكرة مو مستلمة.", view=None)
+        await interaction.response.edit_message(content="✅ تم.", view=None)
+        return await unclaim_ticket(ch, user, info)
+    if action == "ping_owner":
+        await interaction.response.edit_message(content="✅ تم التنبيه.", view=None)
+        await ch.send(f"🔔 <@{info['owner']}> الفريق ينتظر ردك هنا.")
+        owner = guild.get_member(info["owner"])
+        if owner:
+            try:
+                await owner.send(f"🔔 فريق **{guild.name}** ينتظر ردك في تذكرتك: {ch.mention}")
+            except discord.Forbidden:
+                pass
+        return
+    if action == "ping_staff":
+        role = guild.get_role(info["role"]) if info.get("role") else None
+        await interaction.response.edit_message(content="✅ تم الاستدعاء.", view=None)
+        return await ch.send(f"🔔 {role.mention if role else '@here'} صاحب التذكرة يحتاج مساعدة.",
+                             allowed_mentions=discord.AllowedMentions(roles=True, everyone=True))
+    if action == "transcript":
+        await interaction.response.edit_message(content="📜 جاري التجهيز...", view=None)
+        data = await build_transcript(ch)
+        return await interaction.followup.send(
+            file=discord.File(io.BytesIO(data), filename=f"{ch.name}.txt"), ephemeral=True)
+    if action == "info":
+        return await interaction.response.edit_message(content=None, embed=info_embed(ch, info), view=None)
+
+class MoreView(discord.ui.View):
+    """لوحة الإجراءات: أزرار بدل القائمة."""
+    def __init__(self, staff: bool):
+        super().__init__(timeout=120)
+        for action, label, emoji, _ in (STAFF_OPTS if staff else OWNER_OPTS):
+            b = discord.ui.Button(label=label, emoji=emoji, style=discord.ButtonStyle.secondary)
+            b.callback = self._make(action)
+            self.add_item(b)
+
+    @staticmethod
+    def _make(action: str):
+        async def cb(interaction: discord.Interaction):
+            await handle_action(interaction, action)
+        return cb
+
+class TicketControls(discord.ui.View):
+    """أزرار لوحة التحكم داخل التذكرة — الاسم والإيموجي واللون قابلة للتخصيص (insidebtn)."""
+    def __init__(self, guild_id: int = None, claimed: bool = False):
+        super().__init__(timeout=None)
+        saved = conf(guild_id)["inside"]["btn"] if guild_id else {}
+        handlers = {"claim": self.on_claim, "close": self.on_close, "more": self.on_more}
+        for k in ("claim", "close", "more"):
+            d = {**DEFAULT_BTN[k], **saved.get(k, {})}
+            if k == "claim" and claimed:
+                d = {"label": "إلغاء الاستلام", "emoji": "↩️", "style": d.get("style", "gray")}
+            b = discord.ui.Button(label=d["label"], emoji=d.get("emoji") or None,
+                                  style=STYLES.get(d["style"], discord.ButtonStyle.secondary),
+                                  custom_id=f"taqat:ticket_{k}")
+            b.callback = handlers[k]
+            self.add_item(b)
+
+    async def on_claim(self, interaction: discord.Interaction):
+        info = conf(interaction.guild.id)["tickets"].get(str(interaction.channel.id))
+        if not info:
+            return await interaction.response.send_message("❌ هذي مو تذكرة.", ephemeral=True)
+        if not is_staff(interaction.user, info):
+            return await interaction.response.send_message("❌ للفريق فقط.", ephemeral=True)
+        if info.get("claimed"):
+            # الزر صار "إلغاء الاستلام": للمستلم أو لمن عنده إدارة السيرفر
+            if info["claimed"] != interaction.user.id and not interaction.user.guild_permissions.manage_guild:
+                return await interaction.response.send_message(
+                    f"❌ مستلمها <@{info['claimed']}>", ephemeral=True)
+            await interaction.response.defer()
+            return await unclaim_ticket(interaction.channel, interaction.user, info)
+        await interaction.response.defer()
+        await claim_ticket(interaction.channel, interaction.user, info)
+
+    async def on_close(self, interaction: discord.Interaction):
+        info = conf(interaction.guild.id)["tickets"].get(str(interaction.channel.id))
+        if not info:
+            return await interaction.response.send_message("❌ هذي مو تذكرة.", ephemeral=True)
+        if interaction.user.id != info["owner"] and not is_staff(interaction.user, info):
+            return await interaction.response.send_message("❌ ما تقدر تغلقها.", ephemeral=True)
+        await interaction.response.send_message("🔒 جاري الإغلاق وحفظ السجل...")
+        await close_ticket(interaction.channel, interaction.user)
+
+    async def on_more(self, interaction: discord.Interaction):
+        info = conf(interaction.guild.id)["tickets"].get(str(interaction.channel.id))
+        if not info:
+            return await interaction.response.send_message("❌ هذي مو تذكرة.", ephemeral=True)
+        staff = is_staff(interaction.user, info)
+        if not staff and interaction.user.id != info["owner"]:
+            return await interaction.response.send_message("❌ ما عندك صلاحية.", ephemeral=True)
+        await interaction.response.send_message("⚙️ اختر الإجراء المطلوب:", view=MoreView(staff), ephemeral=True)
+
+# ---------- إغلاق تلقائي عند عدم النشاط
+@tasks.loop(minutes=10)
+async def autoclose_loop():
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for guild in bot.guilds:
+        c = conf(guild.id)
+        hrs = c["ticket"]["autoclose"]
+        for cid in list(c["tickets"]):
+            ch = guild.get_channel(int(cid))
+            if not ch:
+                c["tickets"].pop(cid, None)
+                save_data()
+                continue
+            if not hrs:
+                continue
+            last = discord.utils.snowflake_time(ch.last_message_id) if ch.last_message_id else ch.created_at
+            if now - last > datetime.timedelta(hours=hrs):
+                try:
+                    await ch.send(embed=embed("⏰ إغلاق تلقائي", f"لا يوجد نشاط منذ {hrs} ساعة.", 0xFFAA00))
+                    await close_ticket(ch, guild.me, f"إغلاق تلقائي لعدم النشاط ({hrs} ساعة)")
+                except discord.HTTPException:
+                    pass
+
+@autoclose_loop.before_loop
+async def _before_autoclose():
+    await bot.wait_until_ready()
+
+# ---------- إغلاق مجدول
+@tasks.loop(seconds=30)
+async def scheduled_close_loop():
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for guild in bot.guilds:
+        c = conf(guild.id)
+        for cid, info in list(c["tickets"].items()):
+            at = info.get("close_at")
+            if not at:
+                continue
+            try:
+                due = now >= datetime.datetime.fromisoformat(at)
+            except ValueError:
+                info.pop("close_at", None)
+                continue
+            if not due:
+                continue
+            ch = guild.get_channel(int(cid))
+            if not ch:
+                continue
+            reason = info.pop("close_reason", None) or "إغلاق مجدول"
+            closer = guild.get_member(info.pop("close_by", 0)) or guild.me
+            info.pop("close_at", None)
+            save_data()
+            try:
+                await ch.send(embed=embed("⏰ إغلاق مجدول", "حان وقت إغلاق التذكرة.", 0xFFAA00))
+                await close_ticket(ch, closer, reason)
+            except discord.HTTPException:
+                pass
+
+@scheduled_close_loop.before_loop
+async def _before_scheduled_close():
+    await bot.wait_until_ready()
+
+# ---------- تحويل التذكرة لقسم ثاني
+async def move_ticket(channel, info: dict, key: str, mover: discord.Member):
+    guild = channel.guild
+    c = conf(guild.id)
+    t = c["ticket"]["types"].get(key)
+    if not t:
+        return await channel.send("❌ هذا القسم انحذف.")
+    old_label = info.get("type", "—")
+    old_t = next((x for x in c["ticket"]["types"].values() if x["label"] == old_label), {})
+    old_role = guild.get_role(info["role"]) if info.get("role") else None
+    new_role = guild.get_role(t["role"]) if t.get("role") else None
+    category = guild.get_channel(t["category"]) if t.get("category") else None
+
+    try:
+        if old_role and old_role != new_role:
+            await channel.set_permissions(old_role, overwrite=None)
+        if new_role:
+            await channel.set_permissions(new_role, view_channel=True, send_messages=True,
+                                          attach_files=True, read_message_history=True)
+        if category and channel.category_id != category.id:
+            await channel.edit(category=category)
+    except discord.HTTPException:
+        return await channel.send(embed=embed("❌ تعذّر التحويل", "ما قدرت أعدّل الصلاحيات أو الكاتيجوري.", 0xFF5555))
+
+    had_claim = bool(info.get("claimed"))
+    info["type"] = t["label"]
+    info["role"] = t.get("role")
+    info["claimed"] = None
+    save_data()
+
+    def tag(x: dict, label: str) -> str:
+        return f"{x.get('emoji') or '🎫'} {label}"
+
+    e = fancy("🔀 تم تحويل التذكرة",
+              f"تم نقل هذه التذكرة إلى قسم **{t['label']}** بواسطة {mover.mention}",
+              C_INFO,
+              footer="تم إلغاء الاستلام السابق تلقائياً" if had_claim else None)
+    e.add_field(name="القسم السابق", value=tag(old_t, old_label), inline=False)
+    e.add_field(name="القسم الجديد", value=tag(t, t["label"]), inline=False)
+    await channel.send(content=new_role.mention if new_role else None, embed=e,
+                       allowed_mentions=discord.AllowedMentions(roles=True))
+    await refresh_controls(channel, info)
+
+    le = embed("🔀 تحويل تذكرة", color=0x8888FF)
+    le.add_field(name="التذكرة", value=channel.mention)
+    le.add_field(name="من", value=old_label)
+    le.add_field(name="إلى", value=t["label"])
+    le.add_field(name="بواسطة", value=mover.mention)
+    await ticket_log(guild, le)
+
+# ---------- نقاط الدعم (تنحسب تلقائياً عند إغلاق التذكرة)
+def _pts(guild_id: int, staff_id) -> dict:
+    return conf(guild_id)["points"].setdefault(
+        str(staff_id), {"points": 0, "closed": 0, "rating_sum": 0, "rating_count": 0})
+
+def award_points(guild_id: int, staff_id, amount: int):
+    p = _pts(guild_id, staff_id)
+    p["points"] += amount
+    p["closed"] += 1
+
+def record_rating(guild_id: int, staff_id, stars: int):
+    p = _pts(guild_id, staff_id)
+    p["rating_sum"] += stars
+    p["rating_count"] += 1
+    save_data()
+
+def points_order(guild_id: int):
+    return sorted(conf(guild_id)["points"].items(), key=lambda kv: kv[1]["points"], reverse=True)
+
+@bot.hybrid_command(name="points", aliases=["نقاطي", "نقاط"], description="نقاط الدعم الفني (تنحسب تلقائياً عند إغلاق التذاكر)")
+@commands.guild_only()
+async def points_cmd(ctx, member: discord.Member = None):
+    member = member or ctx.author
+    p = conf(ctx.guild.id)["points"].get(str(member.id))
+    e = fancy(f"🏆 نقاط {member.display_name}", color=0xFFD700)
+    e.set_thumbnail(url=member.display_avatar.url)
+    if not p:
+        e.description = "ما عنده نقاط بعد — تنحسب تلقائياً لما يغلق تذكرة هو مستلمها."
+        return await ctx.send(embed=e)
+    order = points_order(ctx.guild.id)
+    rank = next((i for i, (k, _) in enumerate(order, 1) if k == str(member.id)), len(order))
+    e.add_field(name="⭐ النقاط", value=f"**{p['points']}**")
+    e.add_field(name="🎫 تذاكر مغلقة", value=str(p["closed"]))
+    e.add_field(name="🏅 الترتيب", value=f"#{rank} من {len(order)}")
+    if p["rating_count"]:
+        avg = p["rating_sum"] / p["rating_count"]
+        e.add_field(name="⭐ متوسط التقييم", value=f"{avg:.1f} / 5  ({p['rating_count']} تقييم)")
+    await ctx.send(embed=e)
+
+@bot.hybrid_command(name="topstaff", aliases=["توب", "ترتيب_الدعم"], description="ترتيب أفضل أعضاء الدعم بالنقاط")
+@commands.guild_only()
+async def topstaff(ctx):
+    order = points_order(ctx.guild.id)[:10]
+    if not order:
+        return await ctx.send(embed=fancy("🏆 ترتيب الدعم", "ما فيه نقاط بعد.", 0xFFD700))
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, (k, v) in enumerate(order):
+        mark = medals[i] if i < 3 else f"`#{i + 1}`"
+        extra = ""
+        if v["rating_count"]:
+            extra = f" • ⭐ {v['rating_sum'] / v['rating_count']:.1f}"
+        lines.append(f"{mark} <@{k}> — **{v['points']}** نقطة • {v['closed']} تذكرة{extra}")
+    await ctx.send(embed=fancy("🏆 ترتيب الدعم", "\n".join(lines), 0xFFD700))
+
+@bot.hybrid_command(name="pointsadmin", description="إضافة / خصم / تصفير نقاط عضو")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def pointsadmin(ctx, action: Literal["add", "remove", "reset"], member: discord.Member, amount: int = 1):
+    pts = conf(ctx.guild.id)["points"]
+    if action == "reset":
+        pts.pop(str(member.id), None)
+        txt = f"تم تصفير نقاط {member.mention}"
+    else:
+        if not 1 <= amount <= 10000:
+            return await send_err(ctx, "الكمية من 1 إلى 10000.", "رقم غير صحيح")
+        p = _pts(ctx.guild.id, member.id)
+        p["points"] = p["points"] + amount if action == "add" else max(0, p["points"] - amount)
+        txt = f"{member.mention} ← **{p['points']}** نقطة"
+    save_data()
+    await ctx.send(embed=ok_e("تم تحديث النقاط", txt))
+
+@bot.hybrid_command(name="pointsvalue", description="كم نقطة ياخذ المستلم عند إغلاق كل تذكرة")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def pointsvalue(ctx, amount: int):
+    if not 0 <= amount <= 100:
+        return await send_err(ctx, "من 0 إلى 100 (0 = إيقاف النقاط).", "رقم غير صحيح")
+    conf(ctx.guild.id)["ticket"]["point_value"] = amount
+    save_data()
+    await ctx.send(embed=ok_e("نقاط التذكرة", f"المستلم ياخذ **{amount}** نقطة عند إغلاق كل تذكرة."))
+
+@bot.hybrid_command(name="pointsreset", description="تصفير نقاط كل الدعم")
+@commands.has_permissions(administrator=True)
+@commands.guild_only()
+async def pointsreset(ctx):
+    view = ConfirmView(ctx.author.id)
+    msg = await ctx.send(embed=warn_e("تأكيد التصفير", "راح تنمسح نقاط **كل** أعضاء الدعم. ما ينفع التراجع!"), view=view)
+    await view.wait()
+    if not view.value:
+        return await msg.edit(embed=err_e("تم الإلغاء.", "ملغي"), view=None)
+    conf(ctx.guild.id)["points"].clear()
+    save_data()
+    await msg.edit(embed=ok_e("تم تصفير كل النقاط"), view=None)
+
+# ---------- لوحة التذاكر (الرئيسية)
+def panel_message(guild: discord.Guild):
+    c = conf(guild.id)
+    p, types = c["panel"], c["ticket"]["types"]
+    lines = "\n".join(f"> **{t['label']}**" for t in types.values())
+    desc = (lines + "\n\n" if lines else "") + p["desc"]
+    e = discord.Embed(title=p["title"], description=desc, color=parse_color(p["color"]))
+    if p["footer"]:
+        e.set_footer(text=p["footer"])
+    f = apply_image(e, p["image"], "ticket")
+    view = discord.ui.View(timeout=None)
+    for key, t in types.items():
+        view.add_item(TicketButton(key, t["label"], t.get("emoji"), STYLES[t.get("style", "gray")]))
+    return e, f, view
+
+async def refresh_panel(guild: discord.Guild) -> bool:
+    p = conf(guild.id)["panel"]
+    ch = guild.get_channel(p["channel_id"]) if p["channel_id"] else None
+    if not ch or not p["message_id"]:
+        return False
+    try:
+        msg = await ch.fetch_message(p["message_id"])
+        e, f, view = panel_message(guild)
+        await msg.edit(embed=e, view=view, attachments=[f] if f else [])
+        return True
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return False
+
+@bot.hybrid_command(name="ticketpanel", description="إرسال لوحة التذاكر في روم")
+@commands.has_permissions(manage_guild=True)
+async def ticketpanel(ctx, channel: discord.TextChannel, log_channel: discord.TextChannel = None):
+    c = conf(ctx.guild.id)
+    if not c["ticket"]["types"]:
+        return await ctx.send(f"❌ أضف نوع تذكرة أول بـ `{PREFIX}ticketadd`.")
+    if log_channel:
+        c["ticket"]["log_channel"] = log_channel.id
+    e, f, view = panel_message(ctx.guild)
+    msg = await channel.send(embed=e, file=f, view=view)
+    c["panel"]["channel_id"], c["panel"]["message_id"] = channel.id, msg.id
+    save_data()
+    await ctx.send(embed=embed("✅ تم إرسال اللوحة", channel.mention))
+
+@bot.hybrid_command(name="panelset", description="تعديل لوحة التذاكر")
+@commands.has_permissions(manage_guild=True)
+async def panelset(ctx, item: Literal["title", "desc", "footer", "color", "ticketmsg"], *, value: str):
+    """title=العنوان | desc=الشرح | footer=النص تحت الصورة | color=اللون | ticketmsg=رسالة داخل التذكرة"""
+    p = conf(ctx.guild.id)["panel"]
+    if item == "color":
+        if not valid_color(value):
+            return await ctx.send("❌ اللون لازم يكون HEX مثل `2B2D31`.")
+        p["color"] = value.strip().lstrip("#")
+    else:
+        p[item] = nl(value)
+    save_data()
+    done = await refresh_panel(ctx.guild)
+    await ctx.send(embed=embed("✅ تم الحفظ", f"**{item}** ← {value}" + ("\nوتحدّثت اللوحة." if done else "")))
+
+@bot.hybrid_command(name="panelimage", description="تغيير صورة لوحة التذاكر (صورة مرفقة أو رابط)")
+@commands.has_permissions(manage_guild=True)
+async def panelimage(ctx, image: discord.Attachment = None, url: str = None):
+    try:
+        conf(ctx.guild.id)["panel"]["image"] = await store_image(ctx.guild.id, "ticket", image, url)
+    except ValueError as err:
+        return await ctx.send(f"❌ {err}")
+    save_data()
+    done = await refresh_panel(ctx.guild)
+    await ctx.send(embed=embed("✅ تم تغيير الصورة", "وتحدّثت اللوحة." if done else f"أرسل اللوحة بـ `{PREFIX}ticketpanel`"))
+
+@bot.hybrid_command(name="ticketadd", description="إضافة زر/نوع تذكرة")
+@commands.has_permissions(manage_guild=True)
+async def ticketadd(ctx, label: str, emoji: str = None, category: discord.CategoryChannel = None,
+                    role: discord.Role = None, style: Literal["gray", "blue", "green", "red"] = "gray"):
+    """label=اسم الزر | emoji=إيموجي (عادي أو مخصص) | category=كاتيجوري التذاكر | role=رتبة الدعم | style=لون الزر"""
+    c = conf(ctx.guild.id)
+    if len(c["ticket"]["types"]) >= 25:
+        return await ctx.send("❌ الحد الأقصى 25 زر.")
+    if emoji:
+        pe = discord.PartialEmoji.from_str(emoji)
+        if not pe.is_custom_emoji() and not pe.name:
+            return await ctx.send("❌ إيموجي غير صحيح.")
+    c["ticket"]["type_counter"] += 1
+    key = str(c["ticket"]["type_counter"])
+    c["ticket"]["types"][key] = {
+        "label": label, "emoji": emoji, "style": style,
+        "category": category.id if category else None, "role": role.id if role else None}
+    save_data()
+    done = await refresh_panel(ctx.guild)
+    await ctx.send(embed=embed("✅ تمت إضافة الزر", f"{emoji or ''} **{label}**" + ("\nوتحدّثت اللوحة." if done else "")))
+
+@bot.hybrid_command(name="ticketdel", description="حذف زر/نوع تذكرة")
+@commands.has_permissions(manage_guild=True)
+async def ticketdel(ctx, label: str):
+    types = conf(ctx.guild.id)["ticket"]["types"]
+    key = next((k for k, t in types.items() if t["label"].lower() == label.lower()), None)
+    if not key:
+        return await ctx.send("❌ ما لقيت هذا الزر.")
+    types.pop(key)
+    save_data()
+    await refresh_panel(ctx.guild)
+    await ctx.send(embed=embed("🗑️ تم الحذف", label))
+
+@bot.hybrid_command(name="ticketlist", description="عرض أنواع التذاكر")
+@commands.has_permissions(manage_guild=True)
+async def ticketlist(ctx):
+    types = conf(ctx.guild.id)["ticket"]["types"]
+    if not types:
+        return await ctx.send("ما فيه أزرار. أضف بـ `ticketadd`.")
+    lines = [f"{t.get('emoji') or '🎫'} **{t['label']}** — "
+             f"{('<#%s>' % t['category']) if t.get('category') else 'بدون كاتيجوري'} / "
+             f"{('<@&%s>' % t['role']) if t.get('role') else 'بدون رتبة'}"
+             for t in types.values()]
+    await ctx.send(embed=embed("🎫 أنواع التذاكر", "\n".join(lines)))
+
+@bot.hybrid_command(name="ticketlog", description="تحديد روم لوق التذاكر")
+@commands.has_permissions(manage_guild=True)
+async def ticketlog(ctx, channel: discord.TextChannel):
+    conf(ctx.guild.id)["ticket"]["log_channel"] = channel.id
+    save_data()
+    await ctx.send(embed=embed("✅ لوق التذاكر", channel.mention))
+
+@bot.hybrid_command(name="tadd", description="إضافة عضو للتذكرة")
+async def tadd(ctx, member: discord.Member):
+    info = conf(ctx.guild.id)["tickets"].get(str(ctx.channel.id))
+    if not info:
+        return await ctx.send("❌ هذا مو روم تذكرة.")
+    if not is_staff(ctx.author, info):
+        return await ctx.send("❌ للفريق فقط.")
+    await ctx.channel.set_permissions(member, view_channel=True, send_messages=True,
+                                      read_message_history=True)
+    await ctx.send(embed=embed("➕ تمت الإضافة", member.mention))
+
+@bot.hybrid_command(name="tremove", description="إزالة عضو من التذكرة")
+async def tremove(ctx, member: discord.Member):
+    info = conf(ctx.guild.id)["tickets"].get(str(ctx.channel.id))
+    if not info:
+        return await ctx.send("❌ هذا مو روم تذكرة.")
+    if not is_staff(ctx.author, info):
+        return await ctx.send("❌ للفريق فقط.")
+    await ctx.channel.set_permissions(member, overwrite=None)
+    await ctx.send(embed=embed("➖ تمت الإزالة", member.mention))
+
+@bot.hybrid_command(name="tclose", description="إغلاق التذكرة الحالية")
+async def tclose(ctx, *, reason: str = None):
+    info = conf(ctx.guild.id)["tickets"].get(str(ctx.channel.id))
+    if not info:
+        return await ctx.send("❌ هذا مو روم تذكرة.")
+    if ctx.author.id != info["owner"] and not is_staff(ctx.author, info):
+        return await ctx.send("❌ ما تقدر تغلقها.")
+    await ctx.send("🔒 جاري الإغلاق وحفظ السجل...")
+    await close_ticket(ctx.channel, ctx.author, reason)
+
+# ---------- أوامر تذاكر إضافية
+async def get_ticket(ctx, staff: bool = True):
+    info = conf(ctx.guild.id)["tickets"].get(str(ctx.channel.id))
+    if not info:
+        await ctx.send("❌ هذا مو روم تذكرة.")
+        return None
+    if staff and not is_staff(ctx.author, info):
+        await ctx.send("❌ للفريق فقط.")
+        return None
+    return info
+
+@bot.hybrid_command(name="tclaim", description="استلام التذكرة")
+async def tclaim(ctx):
+    info = await get_ticket(ctx)
+    if not info:
+        return
+    err = await claim_ticket(ctx.channel, ctx.author, info)
+    if err:
+        await ctx.send(f"❌ {err}")
+    elif ctx.interaction:
+        await ctx.send("✅", ephemeral=True)
+
+@bot.hybrid_command(name="tunclaim", description="إلغاء استلام التذكرة")
+async def tunclaim(ctx):
+    info = await get_ticket(ctx)
+    if not info:
+        return
+    if not info.get("claimed"):
+        return await ctx.send("❌ التذكرة مو مستلمة.")
+    await unclaim_ticket(ctx.channel, ctx.author, info)
+    if ctx.interaction:
+        await ctx.send("✅", ephemeral=True)
+
+@bot.hybrid_command(name="trename", description="إعادة تسمية التذكرة")
+async def trename(ctx, *, name: str):
+    if not await get_ticket(ctx):
+        return
+    new = re.sub(r"\s+", "-", name.strip().lower())
+    try:
+        await ctx.channel.edit(name=new)
+    except discord.HTTPException:
+        return await ctx.send("❌ ما قدرت أغيّر الاسم (ممكن حد الطلبات).")
+    await ctx.send(embed=embed("✏️ تمت إعادة التسمية", new))
+
+@bot.hybrid_command(name="tpriority", description="تغيير أولوية التذكرة")
+async def tpriority(ctx, level: Literal["low", "normal", "high", "urgent"]):
+    info = await get_ticket(ctx)
+    if info:
+        await set_priority(ctx.channel, info, level)
+
+@bot.hybrid_command(name="tlock", description="منع صاحب التذكرة من الكتابة")
+async def tlock(ctx):
+    info = await get_ticket(ctx)
+    if info:
+        await set_lock(ctx.channel, info, True)
+
+@bot.hybrid_command(name="tunlock", description="السماح لصاحب التذكرة بالكتابة")
+async def tunlock(ctx):
+    info = await get_ticket(ctx)
+    if info:
+        await set_lock(ctx.channel, info, False)
+
+@bot.hybrid_command(name="ttranscript", description="سجل محادثة التذكرة كملف")
+async def ttranscript(ctx):
+    if not await get_ticket(ctx):
+        return
+    data = await build_transcript(ctx.channel)
+    await ctx.send(file=discord.File(io.BytesIO(data), filename=f"{ctx.channel.name}.txt"))
+
+@bot.hybrid_command(name="tblacklist", description="منع/سماح عضو بفتح التذاكر")
+@commands.has_permissions(manage_guild=True)
+async def tblacklist(ctx, action: Literal["add", "remove", "list"], member: discord.Member = None):
+    bl = conf(ctx.guild.id)["ticket"]["blacklist"]
+    if action == "list":
+        txt = "\n".join(f"<@{i}>" for i in bl) or "فاضية."
+        return await ctx.send(embed=embed("🚫 الممنوعين من التذاكر", txt))
+    if not member:
+        return await ctx.send("❌ حدد العضو.")
+    if action == "add":
+        if member.id not in bl:
+            bl.append(member.id)
+    elif member.id in bl:
+        bl.remove(member.id)
+    save_data()
+    await ctx.send(embed=embed("✅ تم", f"{member.mention} — {'ممنوع' if action == 'add' else 'مسموح'}"))
+
+@bot.hybrid_command(name="tmax", description="أقصى عدد تذاكر مفتوحة للعضو الواحد")
+@commands.has_permissions(manage_guild=True)
+async def tmax(ctx, amount: int):
+    if not 1 <= amount <= 10:
+        return await ctx.send("❌ من 1 إلى 10.")
+    conf(ctx.guild.id)["ticket"]["max"] = amount
+    save_data()
+    await ctx.send(embed=embed("✅ تم", f"الحد الأقصى: **{amount}**"))
+
+@bot.hybrid_command(name="tautoclose", description="إغلاق تلقائي بعد عدد ساعات بدون نشاط (0 للإيقاف)")
+@commands.has_permissions(manage_guild=True)
+async def tautoclose(ctx, hours: int):
+    if not 0 <= hours <= 720:
+        return await ctx.send("❌ من 0 إلى 720 ساعة.")
+    conf(ctx.guild.id)["ticket"]["autoclose"] = hours
+    save_data()
+    await ctx.send(embed=embed("✅ تم", f"**{hours}** ساعة" if hours else "الإغلاق التلقائي متوقف"))
+
+@bot.hybrid_command(name="tstats", description="إحصائيات التذاكر")
+@commands.has_permissions(manage_channels=True)
+async def tstats(ctx):
+    c = conf(ctx.guild.id)
+    tk = c["tickets"]
+    claimed = sum(1 for i in tk.values() if i.get("claimed"))
+    e = embed("📊 إحصائيات التذاكر")
+    e.add_field(name="المفتوحة الآن", value=len(tk))
+    e.add_field(name="المستلمة", value=claimed)
+    e.add_field(name="غير مستلمة", value=len(tk) - claimed)
+    e.add_field(name="إجمالي ما انفتح", value=c["ticket"]["counter"])
+    e.add_field(name="الأنواع", value=len(c["ticket"]["types"]))
+    e.add_field(name="الممنوعين", value=len(c["ticket"]["blacklist"]))
+    await ctx.send(embed=e)
+
+# ---------------------------------------------------------------- تخصيص لوحة التحكم داخل التذكرة
+def _none(v: str) -> bool:
+    return v.strip().lower() in ("none", "no", "-", "لا", "بدون")
+
+@bot.hybrid_command(name="insideset", description="تعديل رسالة التحكم داخل التذكرة")
+@commands.has_permissions(manage_guild=True)
+async def insideset(ctx, item: Literal["content", "author", "authoricon", "desc", "footer", "color"], *, value: str):
+    """content=الرسالة فوق | author=الاسم فوق | authoricon=رابط أيقونة الاسم | desc=الوصف | footer=الفوتر | color=اللون
+    المتغيرات: {user} {name} {server} {date} {reason} {type} {ticket} {support} {claimed} — اكتب none للحذف"""
+    ins = conf(ctx.guild.id)["inside"]
+    if item == "color":
+        if not valid_color(value):
+            return await ctx.send("❌ اللون لازم يكون HEX مثل `2B2D31`.")
+        ins["color"] = value.strip().lstrip("#")
+    elif item == "authoricon":
+        if _none(value):
+            ins["author_icon"] = None
+        elif value.startswith("http"):
+            ins["author_icon"] = value.strip()
+        else:
+            return await ctx.send("❌ لازم رابط يبدأ بـ http.")
+    else:
+        ins[item] = "" if _none(value) and item != "desc" else nl(value)
+    save_data()
+    await ctx.send(embed=embed("✅ تم الحفظ", f"**{item}** ← {value[:500]}\nجرّب `{PREFIX}insidepreview`"))
+
+@bot.hybrid_command(name="insideimage", description="تغيير صورة رسالة التحكم داخل التذكرة (مرفق أو رابط)")
+@commands.has_permissions(manage_guild=True)
+async def insideimage(ctx, image: discord.Attachment = None, url: str = None):
+    try:
+        conf(ctx.guild.id)["inside"]["image"] = await store_image(ctx.guild.id, "inside", image, url)
+    except ValueError as err:
+        return await ctx.send(f"❌ {err}")
+    save_data()
+    await ctx.send(embed=embed("✅ تم تغيير الصورة", f"جرّب `{PREFIX}insidepreview`"))
+
+@bot.hybrid_command(name="insideimageoff", description="إزالة صورة رسالة التحكم داخل التذكرة")
+@commands.has_permissions(manage_guild=True)
+async def insideimageoff(ctx):
+    conf(ctx.guild.id)["inside"]["image"] = None
+    save_data()
+    await ctx.send(embed=embed("✅ تمت إزالة الصورة"))
+
+@bot.hybrid_command(name="insidethumb", description="إظهار/إخفاء صورة صاحب التذكرة الصغيرة")
+@commands.has_permissions(manage_guild=True)
+async def insidethumb(ctx, enabled: bool):
+    conf(ctx.guild.id)["inside"]["thumb"] = enabled
+    save_data()
+    await ctx.send(embed=embed("✅ تم", "تظهر" if enabled else "مخفية"))
+
+@bot.hybrid_command(name="insidereason", description="تفعيل/إيقاف سؤال سبب التذكرة عند الفتح")
+@commands.has_permissions(manage_guild=True)
+async def insidereason(ctx, enabled: bool):
+    conf(ctx.guild.id)["inside"]["ask_reason"] = enabled
+    save_data()
+    await ctx.send(embed=embed("✅ تم", "راح يطلع نموذج السبب" if enabled else "بدون نموذج"))
+
+@bot.hybrid_command(name="insidebtn", description="تخصيص أزرار التحكم (الاسم/الإيموجي/اللون)")
+@commands.has_permissions(manage_guild=True)
+async def insidebtn(ctx, button: Literal["claim", "close", "more"], label: str, emoji: str = None,
+                    style: Literal["gray", "blue", "green", "red"] = "gray"):
+    """button=claim/close/more | label=الاسم | emoji=إيموجي (عادي أو مخصص) | style=اللون"""
+    if emoji:
+        pe = discord.PartialEmoji.from_str(emoji)
+        if not pe.is_custom_emoji() and not pe.name:
+            return await ctx.send("❌ إيموجي غير صحيح.")
+    conf(ctx.guild.id)["inside"]["btn"][button] = {"label": label, "emoji": emoji, "style": style}
+    save_data()
+    await ctx.send(embed=embed("✅ تم", f"{emoji or ''} **{label}**\nيطبق على التذاكر الجديدة • جرّب `{PREFIX}insidepreview`"))
+
+@bot.hybrid_command(name="insidepreview", description="معاينة رسالة التحكم داخل التذكرة")
+@commands.has_permissions(manage_guild=True)
+async def insidepreview(ctx):
+    info = {"owner": ctx.author.id, "claimed": None, "type": "معاينة", "role": None,
+            "reason": "هذا سبب تجريبي", "priority": "normal",
+            "opened": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+    content, e, f = build_inside(ctx.guild, ctx.author, ctx.channel, info)
+    await ctx.send(content=content, embed=e, file=f, view=TicketControls(ctx.guild.id))
+
+# ---------------------------------------------------------------- الحماية: روم القوانين
+@bot.hybrid_command(name="rulesguard", description="عقوبة لأي أحد يكتب في روم القوانين")
+@commands.has_permissions(administrator=True)
+@commands.guild_only()
+async def rulesguard(ctx, channel: discord.TextChannel,
+                     action: Literal["delete", "warn", "mute", "kick", "ban"] = "ban"):
+    r = conf(ctx.guild.id)["rules"]
+    r["channel"], r["action"] = channel.id, action
+    save_data()
+    e = ok_e("تم تفعيل حماية روم القوانين")
+    e.add_field(name="💬 الروم", value=channel.mention)
+    e.add_field(name="⚖️ العقوبة", value=f"**{action}**")
+    e.add_field(name="ℹ️ ملاحظة", value="الأدمن والرتب المستثناة ما تنطبق عليهم.", inline=False)
+    await ctx.send(embed=e)
+
+@bot.hybrid_command(name="rulesoff", description="إيقاف حماية روم القوانين")
+@commands.has_permissions(administrator=True)
+@commands.guild_only()
+async def rulesoff(ctx):
+    conf(ctx.guild.id)["rules"]["channel"] = None
+    save_data()
+    await ctx.send(embed=ok_e("تم إيقاف حماية روم القوانين"))
+
+@bot.hybrid_command(name="rulesexempt", description="استثناء/إلغاء استثناء رتبة من حماية القوانين")
+@commands.has_permissions(administrator=True)
+@commands.guild_only()
+async def rulesexempt(ctx, role: discord.Role):
+    ex = conf(ctx.guild.id)["rules"]["exempt"]
+    if role.id in ex:
+        ex.remove(role.id)
+        txt = f"{role.mention} ← انشالت من الاستثناء"
+    else:
+        ex.append(role.id)
+        txt = f"{role.mention} ← مستثناة"
+    save_data()
+    await ctx.send(embed=ok_e("تم تحديث الاستثناءات", txt))
+
+@bot.listen("on_message")
+async def rules_guard(message: discord.Message):
+    if message.author.bot or not message.guild or not isinstance(message.author, discord.Member):
+        return
+    r = conf(message.guild.id)["rules"]
+    if not r["channel"] or message.channel.id != r["channel"]:
+        return
+    m = message.author
+    if m.guild_permissions.administrator or m.id == message.guild.owner_id:
+        return
+    if any(role.id in r["exempt"] for role in m.roles):
+        return
+    try:
+        await message.delete()
+    except discord.HTTPException:
+        pass
+    action, reason = r["action"], "الكتابة في روم القوانين"
+    try:
+        if action == "warn":
+            lst = conf(message.guild.id)["warns"].setdefault(str(m.id), [])
+            lst.append({"reason": reason, "mod": bot.user.id,
+                        "time": datetime.datetime.now(datetime.timezone.utc).isoformat()})
+            save_data()
+        elif action == "mute":
+            await m.timeout(datetime.timedelta(days=1), reason=reason)
+        elif action == "kick":
+            await m.kick(reason=reason)
+        elif action == "ban":
+            await m.ban(reason=reason, delete_message_days=0)
+    except discord.HTTPException:
+        pass
+    e = fancy("🔰 حماية القوانين", color=C_ERR)
+    e.add_field(name="👤 العضو", value=f"{m.mention} (`{m.id}`)")
+    e.add_field(name="⚖️ العقوبة", value=action)
+    e.add_field(name="💬 الرسالة", value=(message.content or "—")[:500], inline=False)
+    await modlog(message.guild, e)
+
+# ---------------------------------------------------------------- الحماية: روابط / كلمات ممنوعة
+@bot.hybrid_command(name="antilink", description="منع الروابط لغير الإدارة")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def antilink(ctx, enabled: bool):
+    conf(ctx.guild.id)["automod"]["antilink"] = enabled
+    save_data()
+    await ctx.send(embed=ok_e("منع الروابط", "🟢 **مفعّل**" if enabled else "🔴 **متوقف**"))
+
+@bot.hybrid_command(name="badword", description="إدارة الكلمات الممنوعة")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def badword(ctx, action: Literal["add", "remove", "list"], word: str = None):
+    words = conf(ctx.guild.id)["automod"]["badwords"]
+    if action == "list":
+        txt = "، ".join(f"||{w}||" for w in words) or "فاضية."
+        return await ctx.send(embed=info_e("🚫 الكلمات الممنوعة", txt), ephemeral=True)
+    if not word:
+        return await send_err(ctx, "اكتب الكلمة.", "كلمة ناقصة")
+    w = word.lower().strip()
+    if action == "add":
+        if w in words:
+            return await send_err(ctx, "الكلمة موجودة من قبل.", "موجودة")
+        words.append(w)
+    else:
+        if w not in words:
+            return await send_err(ctx, "الكلمة مو موجودة بالقائمة.", "غير موجودة")
+        words.remove(w)
+    save_data()
+    await ctx.send(embed=ok_e("تمت الإضافة" if action == "add" else "تمت الإزالة", f"||{w}||"), ephemeral=True)
+
+@bot.listen("on_message")
+async def automod_listener(message: discord.Message):
+    if message.author.bot or not message.guild or not isinstance(message.author, discord.Member):
+        return
+    if message.author.guild_permissions.manage_messages:
+        return
+    a = conf(message.guild.id)["automod"]
+    text = message.content.lower()
+    reason = None
+    if a["antilink"] and URL_RE.search(text):
+        reason = "الروابط ممنوعة"
+    elif any(w in text for w in a["badwords"]):
+        reason = "كلمة ممنوعة"
+    if reason:
+        try:
+            await message.delete()
+            await message.channel.send(embed=err_e(f"{message.author.mention} {reason}", "🛡️ حماية تلقائية"),
+                                       delete_after=5)
+        except discord.HTTPException:
+            pass
+
+# ---------------------------------------------------------------- لوق السيرفر
+@bot.hybrid_command(name="setmodlog", description="تحديد روم لوق السيرفر (حذف/تعديل رسائل، حظر...)")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def setmodlog(ctx, channel: discord.TextChannel):
+    conf(ctx.guild.id)["modlog"]["channel"] = channel.id
+    save_data()
+    await ctx.send(embed=ok_e("تم تحديد لوق السيرفر", channel.mention))
+
+@bot.listen("on_message_delete")
+async def log_delete(message: discord.Message):
+    if not message.guild or message.author.bot:
+        return
+    e = fancy("🗑️ رسالة محذوفة", color=C_ERR)
+    e.add_field(name="👤 الكاتب", value=message.author.mention)
+    e.add_field(name="💬 الروم", value=message.channel.mention)
+    e.add_field(name="📝 المحتوى", value=(message.content or "—")[:1000], inline=False)
+    await modlog(message.guild, e)
+
+@bot.listen("on_message_edit")
+async def log_edit(before: discord.Message, after: discord.Message):
+    if not before.guild or before.author.bot or before.content == after.content:
+        return
+    e = fancy("✏️ رسالة معدّلة", color=C_WARN)
+    e.add_field(name="👤 الكاتب", value=before.author.mention)
+    e.add_field(name="💬 الروم", value=before.channel.mention)
+    e.add_field(name="قبل", value=(before.content or "—")[:500], inline=False)
+    e.add_field(name="بعد", value=(after.content or "—")[:500], inline=False)
+    e.add_field(name="🔗 الرابط", value=f"[اذهب للرسالة]({after.jump_url})")
+    await modlog(before.guild, e)
+
+@bot.listen("on_member_ban")
+async def log_ban(guild: discord.Guild, user: discord.User):
+    await modlog(guild, fancy("🔨 حظر", f"{user} (`{user.id}`)", C_ERR))
+
+@bot.listen("on_member_unban")
+async def log_unban(guild: discord.Guild, user: discord.User):
+    await modlog(guild, fancy("✅ فك حظر", f"{user} (`{user.id}`)", C_OK))
+
+# ---------------------------------------------------------------- الردود التلقائية
+_TASHKEEL = re.compile(r"[\u064b-\u0670\u0640]")
+
+def norm_text(s: str) -> str:
+    """يوحّد النص للمقارنة: بدون تشكيل/رموز، ألف وهاء موحّدة، حروف صغيرة."""
+    s = _norm(_TASHKEEL.sub("", s or "")).lower()
+    s = re.sub(r"[^\w\s]", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+_AR_COOLDOWN: dict[tuple, float] = {}
+
+@bot.listen("on_message")
+async def autoreply_listener(message: discord.Message):
+    if message.author.bot or not message.guild or not isinstance(message.author, discord.Member):
+        return
+    if not message.content or message.content.startswith(PREFIX):
+        return
+    ar = conf(message.guild.id)["autoreply"]
+    if not ar["enabled"] or not ar["list"]:
+        return
+    text = norm_text(message.content)
+    if not text:
+        return
+    hit = ar["list"].get(text)
+    if not hit:
+        for key, item in ar["list"].items():
+            if item.get("mode") == "contains" and re.search(rf"(?<!\w){re.escape(key)}(?!\w)", text):
+                hit = item
+                break
+    if not hit:
+        return
+    ck = (message.guild.id, message.channel.id, norm_text(hit["trigger"]))
+    now = time.monotonic()
+    if now - _AR_COOLDOWN.get(ck, 0) < 8:
+        return
+    _AR_COOLDOWN[ck] = now
+    try:
+        await message.reply(fmt(hit["reply"], message.author), mention_author=False,
+                            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False,
+                                                                     users=True, replied_user=False))
+    except discord.HTTPException:
+        pass
+
+@bot.hybrid_command(name="replyadd", aliases=["اضف_رد"], description='إضافة رد تلقائي — مثال: replyadd "السلام عليكم" وعليكم السلام')
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def replyadd(ctx, trigger: str, *, reply: str):
+    """trigger=الكلمة/الجملة (بين علامات تنصيص إذا فيها مسافات) | reply=رد البوت — المتغيرات: {user} {name} {server} {count}"""
+    ar = conf(ctx.guild.id)["autoreply"]
+    key = norm_text(trigger)
+    if not key:
+        return await send_err(ctx, "الكلمة لازم فيها حروف أو أرقام.", "كلمة غير صحيحة")
+    if len(ar["list"]) >= 50 and key not in ar["list"]:
+        return await send_err(ctx, "الحد الأقصى 50 رد.", "وصلت الحد")
+    reply = nl(reply)
+    if len(reply) > 1500:
+        return await send_err(ctx, "الرد طويل (الحد 1500 حرف).", "رد طويل")
+    old = ar["list"].get(key)
+    ar["list"][key] = {"trigger": trigger.strip(), "reply": reply, "mode": (old or {}).get("mode", "exact")}
+    save_data()
+    e = ok_e("تم تحديث الرد" if old else "تمت إضافة الرد")
+    e.add_field(name="💬 إذا كتب العضو", value=trigger.strip(), inline=False)
+    e.add_field(name="🤖 البوت يرد", value=reply[:1000], inline=False)
+    e.add_field(name="🎯 النوع", value="مطابقة كاملة" if ar["list"][key]["mode"] == "exact" else "يحتوي الكلمة")
+    await ctx.send(embed=e)
+
+@bot.hybrid_command(name="replydel", aliases=["احذف_رد"], description="حذف رد تلقائي")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def replydel(ctx, *, trigger: str):
+    ar = conf(ctx.guild.id)["autoreply"]
+    if ar["list"].pop(norm_text(trigger), None) is None:
+        return await send_err(ctx, "ما لقيت رد بهذي الكلمة. شوف `replylist`.", "غير موجود")
+    save_data()
+    await ctx.send(embed=ok_e("تم حذف الرد", trigger))
+
+@bot.hybrid_command(name="replymode", description="نوع المطابقة: exact = الرسالة كلها، contains = إذا الكلمة داخل الرسالة")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def replymode(ctx, mode: Literal["exact", "contains"], *, trigger: str):
+    ar = conf(ctx.guild.id)["autoreply"]
+    key = norm_text(trigger)
+    item = ar["list"].get(key)
+    if not item:
+        return await send_err(ctx, "ما لقيت رد بهذي الكلمة.", "غير موجود")
+    if mode == "contains" and len(key) < 3:
+        return await send_err(ctx, "وضع `contains` يحتاج كلمة 3 حروف أو أكثر عشان ما يزعج الشات.", "كلمة قصيرة")
+    item["mode"] = mode
+    save_data()
+    await ctx.send(embed=ok_e("تم تغيير النوع", f"**{item['trigger']}** ← {'مطابقة كاملة' if mode == 'exact' else 'يحتوي الكلمة'}"))
+
+@bot.hybrid_command(name="replylist", aliases=["الردود"], description="عرض الردود التلقائية")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def replylist(ctx):
+    ar = conf(ctx.guild.id)["autoreply"]
+    if not ar["list"]:
+        return await ctx.send(embed=info_e("💬 الردود التلقائية", "ما فيه ردود. أضف بـ `replyadd`."))
+    lines = [f"{'🎯' if v['mode'] == 'contains' else '💬'} **{v['trigger']}** ← {v['reply'][:60]}"
+             for v in ar["list"].values()]
+    e = info_e("💬 الردود التلقائية", "\n".join(lines)[:4000])
+    e.add_field(name="الحالة", value="🟢 مفعّلة" if ar["enabled"] else "🔴 متوقفة")
+    e.set_footer(text=f"{BOT_NAME} • 💬 مطابقة كاملة • 🎯 يحتوي الكلمة")
+    await ctx.send(embed=e)
+
+@bot.hybrid_command(name="replytoggle", description="تشغيل/إيقاف الردود التلقائية")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def replytoggle(ctx, enabled: bool):
+    conf(ctx.guild.id)["autoreply"]["enabled"] = enabled
+    save_data()
+    await ctx.send(embed=ok_e("الردود التلقائية", "🟢 **مفعّلة**" if enabled else "🔴 **متوقفة**"))
+
+# ---------------------------------------------------------------- الأذكار والأدعية التلقائية
+TZ_SA = datetime.timezone(datetime.timedelta(hours=3))   # توقيت السعودية (بدون تغيير صيفي)
+GOLD = 0xD4AF37
+
+MORNING = [
+    "أَصْبَحْنَا وَأَصْبَحَ الْمُلْكُ لِلَّهِ، وَالْحَمْدُ لِلَّهِ، لَا إِلَهَ إِلَّا اللَّهُ وَحْدَهُ لَا شَرِيكَ لَهُ، لَهُ الْمُلْكُ وَلَهُ الْحَمْدُ وَهُوَ عَلَى كُلِّ شَيْءٍ قَدِيرٌ",
+    "اللَّهُمَّ بِكَ أَصْبَحْنَا، وَبِكَ أَمْسَيْنَا، وَبِكَ نَحْيَا، وَبِكَ نَمُوتُ، وَإِلَيْكَ النُّشُورُ",
+    "بِسْمِ اللَّهِ الَّذِي لَا يَضُرُّ مَعَ اسْمِهِ شَيْءٌ فِي الْأَرْضِ وَلَا فِي السَّمَاءِ وَهُوَ السَّمِيعُ الْعَلِيمُ (3 مرات)",
+    "رَضِيتُ بِاللَّهِ رَبًّا، وَبِالْإِسْلَامِ دِينًا، وَبِمُحَمَّدٍ ﷺ نَبِيًّا (3 مرات)",
+    "حَسْبِيَ اللَّهُ لَا إِلَهَ إِلَّا هُوَ عَلَيْهِ تَوَكَّلْتُ وَهُوَ رَبُّ الْعَرْشِ الْعَظِيمِ (7 مرات)",
+    "سُبْحَانَ اللَّهِ وَبِحَمْدِهِ (100 مرة)",
+    "📖 لا تنسى: آية الكرسي، والإخلاص والمعوذتين (3 مرات)",
+]
+EVENING = [
+    "أَمْسَيْنَا وَأَمْسَى الْمُلْكُ لِلَّهِ، وَالْحَمْدُ لِلَّهِ، لَا إِلَهَ إِلَّا اللَّهُ وَحْدَهُ لَا شَرِيكَ لَهُ، لَهُ الْمُلْكُ وَلَهُ الْحَمْدُ وَهُوَ عَلَى كُلِّ شَيْءٍ قَدِيرٌ",
+    "اللَّهُمَّ بِكَ أَمْسَيْنَا، وَبِكَ أَصْبَحْنَا، وَبِكَ نَحْيَا، وَبِكَ نَمُوتُ، وَإِلَيْكَ الْمَصِيرُ",
+    "أَعُوذُ بِكَلِمَاتِ اللَّهِ التَّامَّاتِ مِنْ شَرِّ مَا خَلَقَ (3 مرات)",
+    "بِسْمِ اللَّهِ الَّذِي لَا يَضُرُّ مَعَ اسْمِهِ شَيْءٌ فِي الْأَرْضِ وَلَا فِي السَّمَاءِ وَهُوَ السَّمِيعُ الْعَلِيمُ (3 مرات)",
+    "حَسْبِيَ اللَّهُ لَا إِلَهَ إِلَّا هُوَ عَلَيْهِ تَوَكَّلْتُ وَهُوَ رَبُّ الْعَرْشِ الْعَظِيمِ (7 مرات)",
+    "أَسْتَغْفِرُ اللَّهَ وَأَتُوبُ إِلَيْهِ (100 مرة)",
+    "📖 لا تنسى: آية الكرسي، والإخلاص والمعوذتين (3 مرات)",
+]
+DUAS = [
+    "رَبَّنَا آتِنَا فِي الدُّنْيَا حَسَنَةً وَفِي الْآخِرَةِ حَسَنَةً وَقِنَا عَذَابَ النَّارِ",
+    "رَبِّ اشْرَحْ لِي صَدْرِي وَيَسِّرْ لِي أَمْرِي",
+    "اللَّهُمَّ إِنَّكَ عَفُوٌّ تُحِبُّ الْعَفْوَ فَاعْفُ عَنِّي",
+    "يَا حَيُّ يَا قَيُّومُ بِرَحْمَتِكَ أَسْتَغِيثُ",
+    "اللَّهُمَّ إِنِّي أَسْأَلُكَ الْعَفْوَ وَالْعَافِيَةَ فِي الدُّنْيَا وَالْآخِرَةِ",
+    "لَا إِلَهَ إِلَّا أَنْتَ سُبْحَانَكَ إِنِّي كُنْتُ مِنَ الظَّالِمِينَ",
+    "اللَّهُمَّ أَعِنِّي عَلَى ذِكْرِكَ وَشُكْرِكَ وَحُسْنِ عِبَادَتِكَ",
+    "اللَّهُمَّ صَلِّ وَسَلِّمْ عَلَى نَبِيِّنَا مُحَمَّدٍ",
+    "لَا حَوْلَ وَلَا قُوَّةَ إِلَّا بِاللَّهِ",
+    "سُبْحَانَ اللَّهِ، وَالْحَمْدُ لِلَّهِ، وَلَا إِلَهَ إِلَّا اللَّهُ، وَاللَّهُ أَكْبَرُ",
+    "سُبْحَانَ اللَّهِ وَبِحَمْدِهِ، سُبْحَانَ اللَّهِ الْعَظِيمِ",
+    "أَسْتَغْفِرُ اللَّهَ الْعَظِيمَ وَأَتُوبُ إِلَيْهِ",
+    "رَبِّ زِدْنِي عِلْمًا",
+    "رَبَّنَا لَا تُزِغْ قُلُوبَنَا بَعْدَ إِذْ هَدَيْتَنَا وَهَبْ لَنَا مِنْ لَدُنْكَ رَحْمَةً إِنَّكَ أَنْتَ الْوَهَّابُ",
+    "اللَّهُمَّ يَا مُقَلِّبَ الْقُلُوبِ ثَبِّتْ قَلْبِي عَلَى دِينِكَ",
+]
+FRIDAY = "🕌 اليوم الجمعة: أكثر من الصلاة على النبي ﷺ، واقرأ سورة الكهف، وتحرَّ ساعة الإجابة."
+
+def session_embed(key: str, now: datetime.datetime) -> discord.Embed:
+    morning = key == "morning"
+    items = MORNING if morning else EVENING
+    e = fancy("🌅 أذكار الصباح" if morning else "🌙 أذكار المساء",
+              "\n\n".join(f"• {x}" for x in items), GOLD, footer="تقبّل الله منا ومنكم")
+    if morning and now.weekday() == 4:
+        e.add_field(name="\u200b", value=FRIDAY, inline=False)
+    return e
+
+def dua_embed(guild_id: int) -> discord.Embed:
+    pool = DUAS + conf(guild_id)["azkar"]["custom"]
+    return fancy("🤲 دعاء", f"**{random.choice(pool)}**", GOLD, footer="تقبّل الله منا ومنكم")
+
+@tasks.loop(minutes=1)
+async def azkar_loop():
+    now = datetime.datetime.now(TZ_SA)
+    today, hm = now.strftime("%Y-%m-%d"), now.strftime("%H:%M")
+    for guild in bot.guilds:
+        a = conf(guild.id)["azkar"]
+        ch = guild.get_channel(a["channel"]) if a["channel"] else None
+        if not ch:
+            continue
+        try:
+            for key in ("morning", "evening"):
+                s = a[key]
+                if s["on"] and hm == s["time"] and a["last"].get(key) != today:
+                    a["last"][key] = today
+                    save_data()
+                    await ch.send(embed=session_embed(key, now))
+            if a["hours"] and time.time() - a["last_dua"] >= a["hours"] * 3600:
+                a["last_dua"] = time.time()
+                save_data()
+                await ch.send(embed=dua_embed(guild.id))
+        except discord.HTTPException:
+            pass
+
+@azkar_loop.before_loop
+async def _before_azkar():
+    await bot.wait_until_ready()
+
+@bot.command(name="azkarchannel", help="تحديد روم الأذكار التلقائية")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def azkarchannel(ctx, channel: discord.TextChannel):
+    conf(ctx.guild.id)["azkar"]["channel"] = channel.id
+    save_data()
+    await ctx.send(embed=ok_e("روم الأذكار", channel.mention))
+
+@bot.command(name="azkarinterval", help="دعاء عشوائي كل X ساعة (0 للإيقاف)")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def azkarinterval(ctx, hours: int):
+    if not 0 <= hours <= 72:
+        return await send_err(ctx, "من 0 إلى 72 ساعة.", "رقم غير صحيح")
+    a = conf(ctx.guild.id)["azkar"]
+    a["hours"], a["last_dua"] = hours, time.time()
+    save_data()
+    await ctx.send(embed=ok_e("الأدعية الدورية", f"دعاء كل **{hours}** ساعة" if hours else "⏸️ متوقفة"))
+
+@bot.command(name="azkarsession", help="أذكار الصباح/المساء: تشغيل/إيقاف ووقتها (مثال 05:30)")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def azkarsession(ctx, which: Literal["morning", "evening"], enabled: bool, at: str = None):
+    s = conf(ctx.guild.id)["azkar"][which]
+    if at:
+        try:
+            datetime.datetime.strptime(at, "%H:%M")
+        except ValueError:
+            return await send_err(ctx, "اكتبه هكذا: `05:30` (توقيت السعودية).", "وقت غير صحيح")
+        s["time"] = at
+    s["on"] = enabled
+    save_data()
+    await ctx.send(embed=ok_e("الأذكار", f"{'الصباح' if which == 'morning' else 'المساء'}: "
+                                         f"{'🟢 مفعّل' if enabled else '🔴 متوقف'} — الساعة `{s['time']}`"))
+
+@bot.command(name="azkaradd", help="إضافة دعاء/ذكر من عندك للأدعية العشوائية")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def azkaradd(ctx, *, text: str):
+    c = conf(ctx.guild.id)["azkar"]["custom"]
+    if len(c) >= 100:
+        return await send_err(ctx, "الحد الأقصى 100.", "وصلت الحد")
+    c.append(nl(text)[:1000])
+    save_data()
+    await ctx.send(embed=ok_e("تمت الإضافة", text[:500]))
+
+@bot.command(name="azkarnow", help="إرسال ذكر الآن للتجربة")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def azkarnow(ctx, kind: Literal["morning", "evening", "dua"] = "dua"):
+    e = dua_embed(ctx.guild.id) if kind == "dua" else session_embed(kind, datetime.datetime.now(TZ_SA))
+    await ctx.send(embed=e)
+
+# ---------------------------------------------------------------- إشعارات تيك توك
+def fetch_tiktok(user: str):
+    import yt_dlp
+    opts = {"quiet": True, "no_warnings": True, "extract_flat": True,
+            "playlistend": 6, "skip_download": True}
+    with yt_dlp.YoutubeDL(opts) as y:
+        info = y.extract_info(f"https://www.tiktok.com/@{user}", download=False)
+    out = []
+    for e in (info.get("entries") or []):
+        vid = str(e.get("id") or "")
+        if not vid:
+            continue
+        url = e.get("url") or ""
+        if not url.startswith("http"):
+            url = f"https://www.tiktok.com/@{user}/video/{vid}"
+        out.append((vid, url))
+    return out
+
+def clean_tiktok_user(s: str) -> str:
+    """يقبل رابط الحساب (حتى الرابط المختصر) أو @اليوزر أو اليوزر لحاله."""
+    import urllib.request
+    s = s.strip().strip("<>").strip()
+    if s.startswith("http") and re.search(r"(vm|vt)\.tiktok\.com|tiktok\.com/t/", s):
+        try:                                   # رابط مختصر → نجيب الرابط الحقيقي
+            req = urllib.request.Request(s, headers={"User-Agent": "Mozilla/5.0"})
+            s = urllib.request.urlopen(req, timeout=15).geturl()
+        except Exception:
+            pass
+    if "tiktok.com/" in s:
+        s = s.split("tiktok.com/")[-1].split("?")[0].split("/")[0]
+    return s.strip().lstrip("@")
+
+def tiktok_details(url: str, user: str) -> dict:
+    """يجيب وصف الفيديو + الصورة المصغرة + اسم صاحب الحساب."""
+    import urllib.request, urllib.parse
+    d = {"caption": "", "name": user, "thumb": None}
+    try:
+        api = "https://www.tiktok.com/oembed?url=" + urllib.parse.quote(url, safe="")
+        req = urllib.request.Request(api, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            o = json.loads(r.read().decode("utf-8"))
+        d.update(caption=o.get("title") or "", name=o.get("author_name") or user,
+                 thumb=o.get("thumbnail_url"))
+    except Exception:
+        pass
+    if not d["thumb"]:
+        try:
+            import yt_dlp
+            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True}) as y:
+                info = y.extract_info(url, download=False)
+            d.update(caption=d["caption"] or info.get("description") or info.get("title") or "",
+                     name=info.get("uploader") or info.get("channel") or d["name"],
+                     thumb=info.get("thumbnail"))
+        except Exception:
+            pass
+    return d
+
+async def send_tiktok_post(ch, role, url: str, user: str):
+    """رسالة الإشعار: سطر فوق + بطاقة (الوصف + الصورة) + زر مشاهدة الفيديو."""
+    d = await asyncio.to_thread(tiktok_details, url, user)
+    e = discord.Embed(description=(d["caption"] or "")[:2000], color=0xFE2C55)
+    e.set_author(name=d["name"], url=f"https://www.tiktok.com/@{user}")
+    if d["thumb"]:
+        e.set_image(url=d["thumb"])
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="مشاهدة الفيديو", emoji="🎬", url=url))
+    head = f"{role.mention if role else 'يخوان'} **{d['name']}** نزل مقطع"
+    await ch.send(head, embed=e, view=view, allowed_mentions=discord.AllowedMentions(roles=True))
+
+@tasks.loop(minutes=10)
+async def tiktok_loop():
+    for guild in bot.guilds:
+        t = conf(guild.id)["tiktok"]
+        ch = guild.get_channel(t["channel"]) if t["channel"] else None
+        if not t["user"] or not ch:
+            continue
+        try:
+            vids = await asyncio.to_thread(fetch_tiktok, t["user"])
+        except Exception as err:
+            print(f"[tiktok] {t['user']}: {err}")
+            continue
+        new = [v for v in vids if v[0] not in t["seen"]]
+        if not new:
+            continue
+        role = guild.get_role(t["role"]) if t["role"] else None
+        for vid, url in reversed(new):          # الأقدم أول
+            t["seen"].append(vid)
+            try:
+                await send_tiktok_post(ch, role, url, t["user"])
+            except discord.HTTPException:
+                pass
+        t["seen"] = t["seen"][-60:]
+        save_data()
+
+@tiktok_loop.before_loop
+async def _before_tiktok():
+    await bot.wait_until_ready()
+
+@bot.command(name="tiktokset", aliases=["tiktok", "تيكتوك"], help="إشعار عند نزول فيديو جديد: حط رابط حسابك فقط")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def tiktokset(ctx, link: str, channel: Optional[discord.TextChannel] = None, role: Optional[discord.Role] = None):
+    """الاستخدام: !tiktok رابط_حسابك  — الإشعار ينزل في نفس الروم، أو حدد روم/رتبة بعد الرابط"""
+    channel = channel or ctx.channel
+    user = await asyncio.to_thread(clean_tiktok_user, link)
+    if not user or not re.fullmatch(r"[\w.]{2,40}", user):
+        return await send_err(ctx, "ما قدرت أفهم الرابط. حط رابط حسابك مثل:\n`https://www.tiktok.com/@username`",
+                              "رابط غير صحيح")
+    try:
+        vids = await asyncio.to_thread(fetch_tiktok, user)
+    except ModuleNotFoundError:
+        return await send_err(ctx, "مكتبة `yt-dlp` غير مثبتة. أضف سطر `yt-dlp` في ملف `requirements.txt` "
+                                   "وأعد النشر (Deploy).", "ينقص مكتبة")
+    except Exception as err:
+        return await send_err(ctx, f"تأكد إن الحساب عام والرابط صحيح.\n```{str(err)[:300]}```",
+                              "ما قدرت أقرأ الحساب")
+    t = conf(ctx.guild.id)["tiktok"]
+    t.update(user=user, channel=channel.id, role=role.id if role else None,
+             seen=[v[0] for v in vids])      # الفيديوهات الحالية ما تنرسل، الجديد بس
+    save_data()
+    await ctx.send(embed=ok_e("تم تفعيل إشعارات تيك توك",
+                              f"الحساب: **@{user}**\nالروم: {channel.mention}\n"
+                              f"المنشن: {role.mention if role else 'بدون'}\nالفحص كل 10 دقايق."))
+
+@bot.command(name="tiktoktest", help="تجربة شكل إشعار تيك توك بآخر فيديو")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def tiktoktest(ctx):
+    t = conf(ctx.guild.id)["tiktok"]
+    if not t["user"]:
+        return await send_err(ctx, "فعّل أول بـ `!tiktok رابط_حسابك`.", "ما فيه حساب")
+    try:
+        vids = await asyncio.to_thread(fetch_tiktok, t["user"])
+    except Exception as err:
+        return await send_err(ctx, f"```{str(err)[:300]}```", "ما قدرت أقرأ الحساب")
+    if not vids:
+        return await send_err(ctx, "ما لقيت فيديوهات.", "فاضي")
+    role = ctx.guild.get_role(t["role"]) if t["role"] else None
+    await send_tiktok_post(ctx.channel, role, vids[0][1], t["user"])
+
+@bot.command(name="tiktokoff", help="إيقاف إشعارات تيك توك")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def tiktokoff(ctx):
+    conf(ctx.guild.id)["tiktok"].update(user=None, channel=None, role=None, seen=[])
+    save_data()
+    await ctx.send(embed=ok_e("تم إيقاف إشعارات تيك توك"))
+
+# ---------------------------------------------------------------- التكلم باسم البوت (ريلاي)
+@bot.command(name="relayset", help="روم سرّي: أي شي تكتبه فيه البوت يرسله كما هو في روم ثاني")
+@commands.has_permissions(administrator=True)
+@commands.guild_only()
+async def relayset(ctx, source: discord.TextChannel, target: discord.TextChannel):
+    r = conf(ctx.guild.id)["relay"]
+    r["source"], r["target"] = source.id, target.id
+    save_data()
+    await ctx.send(embed=ok_e("تم تفعيل التحدث عبر البوت",
+                              f"اكتب في {source.mention} ← يطلع في {target.mention} باسم البوت.\n"
+                              "يدعم النص والإيموجي والصور والملفات.\n"
+                              "⚠️ خلّ روم الكتابة مخفي إلا عنك وعن الإدارة."))
+
+@bot.command(name="relayoff", help="إيقاف التحدث عبر البوت")
+@commands.has_permissions(administrator=True)
+@commands.guild_only()
+async def relayoff(ctx):
+    r = conf(ctx.guild.id)["relay"]
+    r["source"] = r["target"] = None
+    save_data()
+    await ctx.send(embed=ok_e("تم إيقاف التحدث عبر البوت"))
+
+@bot.listen("on_message")
+async def relay_listener(m: discord.Message):
+    if m.author.bot or not m.guild or not isinstance(m.author, discord.Member):
+        return
+    r = conf(m.guild.id)["relay"]
+    if not r["source"] or m.channel.id != r["source"]:
+        return
+    if not m.author.guild_permissions.manage_guild:
+        return
+    ctx = await bot.get_context(m)
+    if ctx.valid:                       # أمر عادي، لا تنقله
+        return
+    target = m.guild.get_channel(r["target"]) if r["target"] else None
+    if not target or (not m.content and not m.attachments):
+        return
+    files = []
+    for a in m.attachments:
+        try:
+            files.append(await a.to_file(spoiler=a.is_spoiler()))
+        except discord.HTTPException:
+            pass
+    ref = None
+    if m.reference and isinstance(m.reference.resolved, discord.Message) \
+            and m.reference.resolved.channel.id == target.id:
+        ref = m.reference.resolved      # لو رديت على رسالة في الروم الهدف، البوت يرد عليها
+    try:
+        await target.send(
+            m.content or None, files=files, reference=ref, mention_author=False,
+            allowed_mentions=discord.AllowedMentions(
+                everyone=m.author.guild_permissions.mention_everyone, roles=True, users=True))
+        await m.delete()
+    except discord.HTTPException as err:
+        await m.channel.send(embed=err_e(str(err)[:300], "ما قدرت أرسل"), delete_after=8)
+
+# ---------------------------------------------------------------- تحميل مقاطع تيك توك (بدون علامة مائية)
+def download_tiktok(url: str, outdir: str):
+    import yt_dlp
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True,
+            "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
+            "format": "best[format_id!*=download]/best"}   # نتجنب نسخة "download" اللي فيها العلامة المائية
+    with yt_dlp.YoutubeDL(opts) as y:
+        info = y.extract_info(url, download=True)
+        path = y.prepare_filename(info)
+    return path, info
+
+def download_tiktok_fallback(url: str, outdir: str):
+    """طريقة بديلة لو yt-dlp انحظر من تيك توك (سيرفرات الاستضافة أحياناً تنحظر)."""
+    import urllib.request, urllib.parse, shutil
+    ua = {"User-Agent": "Mozilla/5.0"}
+    api = "https://www.tikwm.com/api/?url=" + urllib.parse.quote(url, safe="")
+    with urllib.request.urlopen(urllib.request.Request(api, headers=ua), timeout=25) as r:
+        d = json.loads(r.read().decode("utf-8"))
+    if d.get("code") != 0 or not d.get("data"):
+        raise RuntimeError(d.get("msg") or "فشل جلب المقطع")
+    data = d["data"]
+    vurl = data.get("play") or data.get("hdplay")
+    if not vurl:
+        raise RuntimeError("ما فيه رابط فيديو (ممكن المنشور صور)")
+    if vurl.startswith("/"):
+        vurl = "https://www.tikwm.com" + vurl
+    vid = str(data.get("id") or "video")
+    path = os.path.join(outdir, f"{vid}.mp4")
+    with urllib.request.urlopen(urllib.request.Request(vurl, headers=ua), timeout=90) as r, open(path, "wb") as f:
+        shutil.copyfileobj(r, f)
+    return path, {"id": vid}
+
+@bot.command(name="tt", aliases=["tiktokdl", "تحميل", "تيك"], help="تحميل مقطع تيك توك بدون علامة مائية — حط الرابط")
+@commands.cooldown(1, 15, commands.BucketType.user)
+async def tt_download(ctx, link: str):
+    """الاستخدام: !tt رابط_المقطع"""
+    import tempfile, shutil
+    link = link.strip().strip("<>")
+    if not re.match(r"https?://\S*tiktok\.com/", link):
+        return await send_err(ctx, "حط رابط مقطع تيك توك، مثال:\n`!tt https://www.tiktok.com/@user/video/123`",
+                              "رابط غير صحيح")
+    tmp = tempfile.mkdtemp()
+    try:
+        async with ctx.typing():
+            try:
+                path, info = await asyncio.to_thread(download_tiktok, link, tmp)
+            except Exception as err1:                # yt-dlp ناقص أو انحظر → نجرب الطريقة البديلة
+                try:
+                    path, info = await asyncio.to_thread(download_tiktok_fallback, link, tmp)
+                except Exception as err2:
+                    print(f"[tt] yt-dlp: {err1} | fallback: {err2}")
+                    return await send_err(
+                        ctx, f"تأكد إن الرابط صحيح والمقطع عام.\n```{str(err2)[:250]}```",
+                        "ما قدرت أحمّل المقطع")
+            size = os.path.getsize(path)
+            limit = ctx.guild.filesize_limit if ctx.guild else 10 * 1024 * 1024
+            if size > limit:
+                return await send_err(
+                    ctx, f"حجم المقطع **{size / 1048576:.1f}MB** وأكبر من حد الرفع هنا (**{limit / 1048576:.0f}MB**).",
+                    "المقطع كبير")
+            ext = os.path.splitext(path)[1] or ".mp4"
+            await ctx.reply(file=discord.File(path, filename=f"tiktok_{info.get('id', 'video')}{ext}"),
+                            mention_author=False)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+# ---------------------------------------------------------------- الرومات الصوتية المؤقتة + لوحة التحكم
+TV_ACTIONS = [   # (المفتاح, الإيموجي, الوصف) — كل 5 = صف
+    ("rename", "✏️", "تغيير الاسم"), ("limit", "👥", "حد الأعضاء"), ("privacy", "🔒", "الخصوصية"),
+    ("waiting", "⏳", "غرفة الانتظار"), ("chat", "💬", "الدردشة"),
+    ("trust", "✅", "توثيق عضو"), ("untrust", "❎", "إلغاء التوثيق"), ("invite", "📞", "دعوة"),
+    ("kick", "📵", "طرد"), ("region", "🌍", "المنطقة"),
+    ("ban", "⛔", "حظر"), ("unban", "🔓", "رفع الحظر"), ("claim", "👑", "استلام الملكية"),
+    ("transfer", "🔁", "نقل الملكية"), ("delete", "🗑️", "حذف الروم"),
+]
+TV_REGIONS = [("auto", "تلقائي"), ("rotterdam", "أوروبا (Rotterdam)"), ("india", "الهند"),
+              ("singapore", "سنغافورة"), ("hongkong", "هونغ كونغ"), ("japan", "اليابان"),
+              ("russia", "روسيا"), ("southafrica", "جنوب أفريقيا"), ("sydney", "سيدني"),
+              ("brazil", "البرازيل"), ("us-east", "أمريكا الشرقية"), ("us-central", "أمريكا الوسطى"),
+              ("us-south", "أمريكا الجنوبية"), ("us-west", "أمريكا الغربية")]
+TV_COOLDOWN: dict[int, float] = {}
+
+def tv_owner_perms() -> discord.PermissionOverwrite:
+    return discord.PermissionOverwrite(view_channel=True, connect=True, speak=True,
+                                       move_members=True, mute_members=True)
+
+def tv_emoji(guild_id: int, key: str, default: str) -> str:
+    return conf(guild_id)["tempvoice"]["emoji"].get(key) or default
+
+def tv_legend(guild_id: int) -> str:
+    """سطر لكل صف أزرار — بالعكس عشان ترتيبه البصري (عربي) يطابق الأزرار من اليسار لليمين."""
+    lines = []
+    for i in range(0, len(TV_ACTIONS), 5):
+        row = TV_ACTIONS[i:i + 5]
+        lines.append("\u200f" + "     ".join(f"{tv_emoji(guild_id, k, e)} {d}" for k, e, d in reversed(row)))
+    return "\n".join(lines)
+
+def tv_panel_embed(guild_id: int = 0) -> discord.Embed:
+    """نسخة احتياطية (إيمبد) لو نسخة discord.py ما تدعم التصميم الجديد."""
+    tv = conf(guild_id)["tempvoice"] if guild_id else {"title": "لوحة التحكم بالرومات المؤقتة", "desc": "", "footer": ""}
+    e = discord.Embed(title=f"🎛️ {tv['title']}", description=f"{tv['desc']}\n\n{tv_legend(guild_id) if guild_id else ''}",
+                      color=0xE8505B)
+    e.set_footer(text=tv["footer"] or BOT_NAME)
+    return e
+
+def tv_panel_payload(guild: discord.Guild) -> dict:
+    """نفس شكل لوحة TempVoice: بطاقة (عنوان كبير + وصف + صورة + نص) والأزرار تحتها 3 صفوف × 5."""
+    ui = discord.ui
+    tv = conf(guild.id)["tempvoice"]
+    img_url, img_file = _media(tv.get("image"), "tvpanel")
+    items = [ui.TextDisplay(f"# {tv['title']}"), ui.TextDisplay(tv["desc"])]
+    if img_url:
+        items.append(ui.MediaGallery(discord.MediaGalleryItem(img_url)))
+    else:
+        items.append(ui.TextDisplay(tv_legend(guild.id)))
+    if tv["footer"]:
+        items.append(ui.TextDisplay(f"**{tv['footer']}**"))
+    view = ui.LayoutView(timeout=None)
+    view.add_item(ui.Container(*items, accent_colour=discord.Colour(0xE8505B)))
+    for i in range(0, len(TV_ACTIONS), 5):
+        buttons = []
+        for key, em, _ in TV_ACTIONS[i:i + 5]:
+            b = ui.Button(emoji=tv_emoji(guild.id, key, em), style=discord.ButtonStyle.secondary,
+                          custom_id=f"taqat:tv:{key}")
+            b.callback = TVPanel._make(key)
+            buttons.append(b)
+        view.add_item(ui.ActionRow(*buttons))
+    return {"view": view, "files": [img_file] if img_file else [],
+            "allowed_mentions": discord.AllowedMentions.none()}
+
+async def tv_send_panel(dest, guild: discord.Guild):
+    if hasattr(discord.ui, "LayoutView"):
+        try:
+            return await dest.send(**tv_panel_payload(guild))
+        except Exception:
+            traceback.print_exc()
+    return await dest.send(embed=tv_panel_embed(guild.id), view=TVPanel())
+
+def tv_room(interaction: discord.Interaction):
+    vs = getattr(interaction.user, "voice", None)
+    ch = vs.channel if vs and vs.channel else None
+    rooms = conf(interaction.guild.id)["tempvoice"]["rooms"]
+    if not ch or str(ch.id) not in rooms:
+        return None, None
+    return ch, rooms[str(ch.id)]
+
+async def tv_delete_room(guild: discord.Guild, channel: discord.VoiceChannel, reason: str):
+    tv = conf(guild.id)["tempvoice"]
+    info = tv["rooms"].pop(str(channel.id), None)
+    save_data()
+    if info and info.get("waiting"):
+        w = guild.get_channel(info["waiting"])
+        if w:
+            try:
+                await w.delete(reason=reason)
+            except discord.HTTPException:
+                pass
+    try:
+        await channel.delete(reason=reason)
+    except discord.HTTPException:
+        pass
+
+class TVRenameModal(discord.ui.Modal, title="تغيير اسم الروم"):
+    name = discord.ui.TextInput(label="الاسم الجديد", max_length=90)
+
+    def __init__(self, channel_id: int):
+        super().__init__()
+        self.channel_id = channel_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        ch = interaction.guild.get_channel(self.channel_id)
+        if not ch:
+            return await interaction.response.send_message("❌ الروم انحذف.", ephemeral=True)
+        try:
+            await ch.edit(name=str(self.name).strip())
+        except discord.HTTPException:
+            return await interaction.response.send_message(
+                "❌ ما قدرت أغيّر الاسم (ديسكورد يسمح بتغييرين كل 10 دقايق).", ephemeral=True)
+        await interaction.response.send_message(f"✅ الاسم الجديد: **{ch.name}**", ephemeral=True)
+
+class TVLimitModal(discord.ui.Modal, title="حد عدد الأعضاء"):
+    num = discord.ui.TextInput(label="العدد من 1 إلى 99 (0 = بدون حد)", max_length=2)
+
+    def __init__(self, channel_id: int):
+        super().__init__()
+        self.channel_id = channel_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        ch = interaction.guild.get_channel(self.channel_id)
+        if not ch:
+            return await interaction.response.send_message("❌ الروم انحذف.", ephemeral=True)
+        v = str(self.num).strip()
+        if not v.isdigit() or not 0 <= int(v) <= 99:
+            return await interaction.response.send_message("❌ اكتب رقم من 0 إلى 99.", ephemeral=True)
+        await ch.edit(user_limit=int(v))
+        await interaction.response.send_message(
+            f"✅ الحد: **{v}**" if int(v) else "✅ تم إلغاء الحد.", ephemeral=True)
+
+class TVPrivacyView(discord.ui.View):
+    def __init__(self, channel_id: int):
+        super().__init__(timeout=120)
+        self.channel_id = channel_id
+
+    @discord.ui.select(placeholder="🔒 اختر الخصوصية", options=[
+        discord.SelectOption(label="مفتوح", value="open", emoji="🔓", description="الكل يشوفه ويدخله"),
+        discord.SelectOption(label="مقفل", value="locked", emoji="🔒", description="الكل يشوفه، بس ما أحد يدخل إلا الموثّقين"),
+        discord.SelectOption(label="مخفي", value="hidden", emoji="🙈", description="ما يشوفه إلا الموثّقين"),
+    ])
+    async def pick(self, interaction: discord.Interaction, select: discord.ui.Select):
+        ch = interaction.guild.get_channel(self.channel_id)
+        if not ch:
+            return await interaction.response.edit_message(content="❌ الروم انحذف.", view=None)
+        v, role = select.values[0], interaction.guild.default_role
+        if v == "open":
+            await ch.set_permissions(role, view_channel=None, connect=None)
+        elif v == "locked":
+            await ch.set_permissions(role, view_channel=None, connect=False)
+        else:
+            await ch.set_permissions(role, view_channel=False, connect=False)
+        names = {"open": "🔓 مفتوح", "locked": "🔒 مقفل", "hidden": "🙈 مخفي"}
+        await interaction.response.edit_message(content=f"✅ الخصوصية: **{names[v]}**", view=None)
+
+class TVRegionView(discord.ui.View):
+    def __init__(self, channel_id: int):
+        super().__init__(timeout=120)
+        self.channel_id = channel_id
+        self.select = discord.ui.Select(placeholder="🌍 اختر المنطقة", options=[
+            discord.SelectOption(label=name, value=key) for key, name in TV_REGIONS])
+        self.select.callback = self.on_pick
+        self.add_item(self.select)
+
+    async def on_pick(self, interaction: discord.Interaction):
+        ch = interaction.guild.get_channel(self.channel_id)
+        if not ch:
+            return await interaction.response.edit_message(content="❌ الروم انحذف.", view=None)
+        v = self.select.values[0]
+        try:
+            await ch.edit(rtc_region=None if v == "auto" else v)
+        except discord.HTTPException:
+            return await interaction.response.edit_message(content="❌ ما قدرت أغيّر المنطقة.", view=None)
+        await interaction.response.edit_message(
+            content=f"✅ المنطقة: **{dict(TV_REGIONS)[v]}**", view=None)
+
+class TVUserPick(discord.ui.View):
+    """اختيار عضو لتنفيذ: توثيق / إلغاء توثيق / دعوة / طرد / حظر / رفع حظر / نقل ملكية."""
+    def __init__(self, action: str, channel_id: int):
+        super().__init__(timeout=120)
+        self.action, self.channel_id = action, channel_id
+
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="👤 اختر العضو")
+    async def pick(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+        guild, user = interaction.guild, interaction.user
+        ch = guild.get_channel(self.channel_id)
+        info = conf(guild.id)["tempvoice"]["rooms"].get(str(self.channel_id))
+        target = guild.get_member(select.values[0].id)
+
+        async def done(msg):
+            await interaction.response.edit_message(content=msg, view=None)
+
+        if not ch or not info:
+            return await done("❌ الروم انحذف.")
+        if info["owner"] != user.id:
+            return await done("❌ للمالك فقط.")
+        if not target:
+            return await done("❌ العضو مو بالسيرفر.")
+        if target.id == user.id:
+            return await done("❌ ما تقدر تنفذ هذا على نفسك.")
+        if target.bot:
+            return await done("❌ ما ينفع مع البوتات.")
+        a = self.action
+        try:
+            if a == "trust":
+                await ch.set_permissions(target, view_channel=True, connect=True, speak=True)
+                return await done(f"✅ وثّقت {target.mention} — يدخل رومك حتى لو مقفل.")
+            if a == "untrust":
+                await ch.set_permissions(target, overwrite=None)
+                return await done(f"✅ ألغيت توثيق {target.mention}.")
+            if a == "ban":
+                await ch.set_permissions(target, view_channel=False, connect=False)
+                if target in ch.members:
+                    await target.move_to(None)
+                return await done(f"⛔ حظرت {target.mention} من رومك.")
+            if a == "unban":
+                await ch.set_permissions(target, overwrite=None)
+                return await done(f"✅ رفعت الحظر عن {target.mention}.")
+            if a == "kick":
+                if target not in ch.members:
+                    return await done("❌ العضو مو داخل الروم.")
+                await target.move_to(None)
+                return await done(f"🥾 طردت {target.mention} من الروم.")
+            if a == "invite":
+                await ch.set_permissions(target, view_channel=True, connect=True, speak=True)
+                try:
+                    inv = await ch.create_invite(max_age=3600, max_uses=1, reason=f"دعوة من {user}")
+                    await target.send(f"📨 **{user.display_name}** يدعوك لروم **{ch.name}** في **{guild.name}**\n{inv.url}")
+                    return await done(f"✅ أرسلت دعوة لـ {target.mention} في الخاص.")
+                except (discord.Forbidden, discord.HTTPException):
+                    return await done(f"✅ أعطيته صلاحية الدخول، بس خاصه مقفل — خبّره يدخل {ch.mention}.")
+            if a == "transfer":
+                info["owner"] = target.id
+                save_data()
+                await ch.set_permissions(user, overwrite=None)
+                await ch.set_permissions(target, overwrite=tv_owner_perms())
+                return await done(f"👑 صار {target.mention} مالك الروم.")
+        except discord.HTTPException:
+            return await done("❌ صار خطأ، تأكد من صلاحيات البوت (إدارة الرومات + نقل الأعضاء).")
+
+async def tv_handle(interaction: discord.Interaction, action: str):
+    guild, user = interaction.guild, interaction.user
+    send = interaction.response.send_message
+    ch, info = tv_room(interaction)
+    if not ch:
+        return await send("❌ لازم تكون داخل رومك الصوتي المؤقت أول.", ephemeral=True)
+
+    if action == "claim":
+        if info["owner"] == user.id:
+            return await send("👑 أنت المالك أصلاً.", ephemeral=True)
+        owner = guild.get_member(info["owner"])
+        if owner and owner in ch.members:
+            return await send(f"❌ المالك {owner.mention} لسا داخل الروم.", ephemeral=True)
+        if owner:
+            await ch.set_permissions(owner, overwrite=None)
+        info["owner"] = user.id
+        save_data()
+        await ch.set_permissions(user, overwrite=tv_owner_perms())
+        return await send(f"👑 صرت مالك الروم **{ch.name}**.", ephemeral=True)
+
+    if info["owner"] != user.id:
+        return await send(f"❌ للمالك فقط: <@{info['owner']}>", ephemeral=True,
+                          allowed_mentions=discord.AllowedMentions.none())
+
+    if action == "rename":
+        return await interaction.response.send_modal(TVRenameModal(ch.id))
+    if action == "limit":
+        return await interaction.response.send_modal(TVLimitModal(ch.id))
+    if action == "privacy":
+        return await send("🔒 اختر الخصوصية:", view=TVPrivacyView(ch.id), ephemeral=True)
+    if action == "region":
+        return await send("🌍 اختر المنطقة:", view=TVRegionView(ch.id), ephemeral=True)
+    if action in ("trust", "untrust", "invite", "kick", "ban", "unban", "transfer"):
+        return await send("👤 اختر العضو:", view=TVUserPick(action, ch.id), ephemeral=True)
+
+    if action == "chat":
+        role = guild.default_role
+        closed = ch.overwrites_for(role).send_messages is False
+        await ch.set_permissions(role, send_messages=None if closed else False)
+        return await send("💬 الدردشة **مفتوحة** للجميع." if closed else "💬 الدردشة **مقفلة**.",
+                          ephemeral=True)
+
+    if action == "waiting":
+        w = guild.get_channel(info["waiting"]) if info.get("waiting") else None
+        if w:
+            try:
+                await w.delete(reason="حذف غرفة الانتظار")
+            except discord.HTTPException:
+                pass
+            info["waiting"] = None
+            save_data()
+            return await send("⏳ انحذفت غرفة الانتظار.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        ow = {user: tv_owner_perms(),
+              guild.me: discord.PermissionOverwrite(view_channel=True, connect=True,
+                                                    manage_channels=True, move_members=True)}
+        try:
+            w = await guild.create_voice_channel(f"⏳ انتظار | {ch.name}"[:100], category=ch.category,
+                                                 overwrites=ow, reason="غرفة انتظار")
+        except discord.HTTPException:
+            return await interaction.followup.send("❌ ما قدرت أسوي غرفة الانتظار.", ephemeral=True)
+        info["waiting"] = w.id
+        save_data()
+        return await interaction.followup.send(
+            f"⏳ تم إنشاء {w.mention}. اقفل رومك من زر 🔒 وخل الناس تنتظر هناك، "
+            "وانقلهم لرومك بالسحب (أنت عندك صلاحية النقل).", ephemeral=True)
+
+    if action == "delete":
+        await send("🗑️ جاري حذف الروم...", ephemeral=True)
+        await tv_delete_room(guild, ch, f"حذف بواسطة {user}")
+
+class TVPanel(discord.ui.View):
+    """لوحة التحكم الدائمة (تشتغل حتى بعد إعادة تشغيل البوت)."""
+    def __init__(self):
+        super().__init__(timeout=None)
+        for i, (key, emoji, _) in enumerate(TV_ACTIONS):
+            b = discord.ui.Button(emoji=emoji, style=discord.ButtonStyle.secondary,
+                                  custom_id=f"taqat:tv:{key}", row=i // 5)
+            b.callback = self._make(key)
+            self.add_item(b)
+
+    @staticmethod
+    def _make(key: str):
+        async def cb(interaction: discord.Interaction):
+            await tv_handle(interaction, key)
+        return cb
+
+@bot.listen("on_voice_state_update")
+async def tv_voice_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    if member.bot:
+        return
+    guild = member.guild
+    tv = conf(guild.id)["tempvoice"]
+
+    # دخل روم الإنشاء → نسوي له روم
+    if after.channel and tv["hub"] and after.channel.id == tv["hub"] and before.channel != after.channel:
+        for cid, info in tv["rooms"].items():          # عنده روم أصلاً؟ نرجعه له
+            existing = guild.get_channel(int(cid))
+            if existing and info["owner"] == member.id:
+                try:
+                    await member.move_to(existing)
+                except discord.HTTPException:
+                    pass
+                return
+        now = time.monotonic()
+        if now - TV_COOLDOWN.get(member.id, 0) < 8:
+            try:
+                await member.move_to(None)
+            except discord.HTTPException:
+                pass
+            return
+        TV_COOLDOWN[member.id] = now
+        hub = after.channel
+        name = tv["name"].replace("{name}", member.display_name)[:100]
+        ow = {member: tv_owner_perms(),
+              guild.me: discord.PermissionOverwrite(view_channel=True, connect=True,
+                                                    manage_channels=True, move_members=True)}
+        try:
+            ch = await guild.create_voice_channel(name, category=hub.category, overwrites=ow,
+                                                  reason=f"روم مؤقت لـ {member}")
+        except discord.HTTPException:
+            return
+        tv["rooms"][str(ch.id)] = {"owner": member.id, "waiting": None}
+        save_data()
+        try:
+            await member.move_to(ch)
+        except discord.HTTPException:
+            await tv_delete_room(guild, ch, "فشل نقل العضو")
+            return
+        try:
+            await ch.send(f"👑 {member.mention} مالك هذا الروم — تحكم فيه من لوحة التحكم.",
+                          allowed_mentions=discord.AllowedMentions(users=True))
+        except discord.HTTPException:
+            pass
+
+    # الروم المؤقت فضي → نحذفه
+    if before.channel and before.channel != after.channel and str(before.channel.id) in tv["rooms"]:
+        if not before.channel.members:
+            await tv_delete_room(guild, before.channel, "الروم المؤقت فاضي")
+
+@bot.listen("on_ready")
+async def tv_cleanup():
+    for guild in bot.guilds:
+        tv = conf(guild.id)["tempvoice"]
+        for cid in list(tv["rooms"]):
+            ch = guild.get_channel(int(cid))
+            if not ch:
+                tv["rooms"].pop(cid, None)
+            elif not ch.members:
+                await tv_delete_room(guild, ch, "تنظيف بعد إعادة التشغيل")
+        save_data()
+
+@bot.command(name="tempvoice", aliases=["رومات_مؤقتة"], help="تفعيل الرومات الصوتية المؤقتة (بدون ما تحدد شي ينشئ كل شي تلقائياً)")
+@commands.has_permissions(manage_guild=True)
+@commands.bot_has_permissions(manage_channels=True)
+@commands.guild_only()
+async def tempvoice_cmd(ctx, hub: Optional[discord.VoiceChannel] = None):
+    """!tempvoice  ← ينشئ كاتيجوري + روم الإنشاء + روم اللوحة | !tempvoice #روم-صوتي ← يستخدم روم موجود، واللوحة تنرسل هنا"""
+    g, tv = ctx.guild, conf(ctx.guild.id)["tempvoice"]
+    old = g.get_channel(tv["hub"]) if tv["hub"] else None
+    if old and not hub:
+        return await send_err(ctx, f"مفعّل من قبل: {old.mention}\nلإعادة إرسال اللوحة: `{PREFIX}tempvoicepanel`",
+                              "مفعّل مسبقاً")
+    if hub:
+        tv["hub"] = hub.id
+        save_data()
+        await tv_send_panel(ctx, g)
+        return await ctx.send(embed=ok_e("تم التفعيل", f"روم الإنشاء: {hub.mention}\nاللوحة أُرسلت هنا."))
+    cat = await g.create_category("🔊 رومات مؤقتة")
+    hub = await g.create_voice_channel("➕ أنشئ رومك", category=cat)
+    panel = await g.create_text_channel(
+        "🎛️-التحكم", category=cat,
+        overwrites={g.default_role: discord.PermissionOverwrite(send_messages=False),
+                    g.me: discord.PermissionOverwrite(send_messages=True, embed_links=True)})
+    tv["hub"], tv["category"] = hub.id, cat.id
+    save_data()
+    await tv_send_panel(panel, g)
+    await ctx.send(embed=ok_e("تم تفعيل الرومات المؤقتة",
+                              f"ادخل {hub.mention} وبيتسوّى لك روم.\nاللوحة: {panel.mention}"))
+
+@bot.command(name="tempvoicepanel", help="إرسال لوحة التحكم في هذا الروم")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def tempvoicepanel(ctx):
+    await tv_send_panel(ctx, ctx.guild)
+
+@bot.command(name="tempvoicename", help="شكل اسم الروم المؤقت — استخدم {name} لاسم العضو")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def tempvoicename(ctx, *, template: str):
+    conf(ctx.guild.id)["tempvoice"]["name"] = template[:80]
+    save_data()
+    await ctx.send(embed=ok_e("تم", f"اسم الروم: `{template[:80]}`"))
+
+@bot.command(name="tempvoiceoff", help="إيقاف الرومات المؤقتة (الرومات الحالية تبقى)")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def tempvoiceoff(ctx):
+    conf(ctx.guild.id)["tempvoice"]["hub"] = None
+    save_data()
+    await ctx.send(embed=ok_e("تم الإيقاف", "ما راح تنسوى رومات جديدة. امسح روم الإنشاء يدوياً لو تبي."))
+
+@bot.command(name="tempvoiceemoji", help="تغيير إيموجي زر في لوحة الرومات المؤقتة (يقبل إيموجي السيرفر المخصصة)")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def tempvoiceemoji(ctx, button: str, emoji: str = None):
+    """الاستخدام: !tempvoiceemoji rename <:اسم:123>   |   !tempvoiceemoji rename reset   |   !tempvoiceemoji list
+    الأزرار: rename limit privacy waiting chat trust untrust invite kick region ban unban claim transfer delete"""
+    em = conf(ctx.guild.id)["tempvoice"]["emoji"]
+    keys = [k for k, _, _ in TV_ACTIONS]
+    if button == "list":
+        return await ctx.send(embed=info_e("🎛️ أزرار اللوحة", "\n".join(
+            f"`{k}` ← {tv_emoji(ctx.guild.id, k, e)} {d}" for k, e, d in TV_ACTIONS)))
+    if button not in keys:
+        return await send_err(ctx, "اسم الزر غير صحيح. اكتب `!tempvoiceemoji list` تشوف الأسماء.", "زر غير موجود")
+    if not emoji or emoji.lower() in ("reset", "off"):
+        em.pop(button, None)
+        save_data()
+        return await ctx.send(embed=ok_e("رجّعت الإيموجي الافتراضي", f"`{button}`"))
+    pe = discord.PartialEmoji.from_str(emoji)
+    if not pe.is_custom_emoji() and not pe.name:
+        return await send_err(ctx, "إيموجي غير صحيح.", "إيموجي خاطئ")
+    em[button] = emoji
+    save_data()
+    await ctx.send(embed=ok_e("تم تغيير الإيموجي", f"`{button}` ← {emoji}\nأرسل اللوحة من جديد بـ `{PREFIX}tempvoicepanel`"))
+
+@bot.command(name="tempvoiceimage", help="الصورة اللي بنص لوحة الرومات المؤقتة (مرفق أو رابط، أو off للإزالة)")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def tempvoiceimage(ctx, url: str = None):
+    tv = conf(ctx.guild.id)["tempvoice"]
+    if url and url.strip().lower() in ("off", "none", "-"):
+        tv["image"] = None
+        save_data()
+        return await ctx.send(embed=ok_e("تمت إزالة الصورة"))
+    att = ctx.message.attachments[0] if ctx.message.attachments else None
+    try:
+        tv["image"] = await store_image(ctx.guild.id, "tvpanel", att, url)
+    except ValueError as err:
+        return await send_err(ctx, str(err), "صورة غير صحيحة")
+    save_data()
+    await ctx.send(embed=ok_e("تم تغيير الصورة", f"أرسل اللوحة من جديد بـ `{PREFIX}tempvoicepanel`"))
+
+@bot.command(name="tempvoicetext", help="نصوص اللوحة: title / desc / footer")
+@commands.has_permissions(manage_guild=True)
+@commands.guild_only()
+async def tempvoicetext(ctx, item: Literal["title", "desc", "footer"], *, value: str):
+    conf(ctx.guild.id)["tempvoice"][item] = nl(value)
+    save_data()
+    await ctx.send(embed=ok_e("تم الحفظ", f"**{item}** ← {value[:300]}\nأرسل اللوحة من جديد بـ `{PREFIX}tempvoicepanel`"))
+
+# ================================================================ نظام التقديم (تخصيص كامل) + نظام الافتارات
+def staff_only(f):
+    """صلاحية إدارة السيرفر داخل السيرفر فقط (تنفع للأوامر الفرعية)."""
+    return commands.guild_only()(commands.has_permissions(manage_guild=True)(f))
+
+def _is_off(v) -> bool:
+    return str(v).strip().lower() in ("off", "none", "-", "0", "حذف", "ازالة", "إزالة")
+
+# ---------------------------------------------------------------- التقديم: البيانات
+APPLY_PAGE = 5                       # ديسكورد يسمح بـ 5 حقول فقط في النافذة الواحدة
+APPLY_DRAFTS: dict[tuple, list] = {}
+
+def apply_default(name: str) -> dict:
+    return {
+        "name": name, "open": True,
+        "questions": ["الاسم والعمر؟", "ليش تبي تنضم؟", "وش خبرتك السابقة؟", "كم ساعة تتواجد يومياً؟"],
+        "channel": None, "role": None, "reviewers": None,
+        "title": f"يسرّنا فتح التقديم على {name}",
+        "desc": "يرجى تعبئة جميع المعلومات المطلوبة والإجابة بوضوح، دون تحايل نهائياً.",
+        "label": name, "button": "تقديم الآن",
+        "top": None, "bottom": None, "color": "C9A66B",
+    }
+
+def apply_find(guild_id: int, ref: str):
+    types = conf(guild_id)["apply"]["types"]
+    ref = ref.strip().lstrip("#")
+    if ref in types:
+        return ref, types[ref]
+    for tid, t in types.items():
+        if t["name"].lower() == ref.lower():
+            return tid, t
+    return None, None
+
+def apply_prune(ap: dict):
+    done = [k for k, s in ap["subs"].items() if s["status"] != "pending"]
+    for k in done[:-200]:
+        ap["subs"].pop(k, None)
+
+# ---------------------------------------------------------------- التقديم: اللوحة (نفس تصميم الصورة)
+def apply_panel_payload(tid: str, t: dict) -> dict:
+    ui = discord.ui
+    top, f1 = _media(t.get("top"), f"apply{tid}_top")
+    low, f2 = _media(t.get("bottom"), f"apply{tid}_bottom")
+    items = []
+    if top:
+        items.append(ui.MediaGallery(discord.MediaGalleryItem(top)))
+    items.append(ui.TextDisplay(f"### {t['title']}"))
+    if t["desc"]:
+        items.append(ui.TextDisplay(t["desc"]))
+    items.append(ui.Separator())
+    btn = ui.Button(label=(t["button"] if t["open"] else "التقديم مغلق")[:80],
+                    style=discord.ButtonStyle.secondary, custom_id=f"taqat:apply:{tid}",
+                    disabled=not t["open"])
+    items.append(ui.Section(ui.TextDisplay(f"**{t['label']}** →"), accessory=btn))
+    if low:
+        items += [ui.Separator(), ui.MediaGallery(discord.MediaGalleryItem(low))]
+    view = ui.LayoutView(timeout=None)
+    view.add_item(ui.Container(*items, accent_colour=discord.Colour(parse_color(t["color"]))))
+    return {"view": view, "files": [f for f in (f1, f2) if f],
+            "allowed_mentions": discord.AllowedMentions.none()}
+
+async def apply_send_panel(dest, tid: str, t: dict):
+    if hasattr(discord.ui, "LayoutView"):
+        try:
+            return await dest.send(**apply_panel_payload(tid, t))
+        except Exception:
+            traceback.print_exc()
+    e = discord.Embed(title=t["title"], description=t["desc"], color=parse_color(t["color"]))
+    f = apply_image(e, t.get("bottom") or t.get("top"), f"apply{tid}")
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(label=t["button"][:80], style=discord.ButtonStyle.secondary,
+                                    custom_id=f"taqat:apply:{tid}"))
+    return await dest.send(embed=e, view=view, files=[f] if f else [])
+
+# ---------------------------------------------------------------- التقديم: تعبئة الأسئلة
+class ApplyModal(discord.ui.Modal):
+    def __init__(self, tid: str, t: dict, page: int):
+        qs = t["questions"]
+        self.pages = (len(qs) + APPLY_PAGE - 1) // APPLY_PAGE
+        title = t["name"] if self.pages == 1 else f"{t['name']} ({page + 1}/{self.pages})"
+        super().__init__(title=title[:45])
+        self.tid, self.page = tid, page
+        self.qs = qs[page * APPLY_PAGE:(page + 1) * APPLY_PAGE]
+        self.inputs = []
+        for q in self.qs:
+            ti = discord.ui.TextInput(label=q[:45], placeholder=(q[:100] if len(q) > 45 else None),
+                                      style=discord.TextStyle.paragraph, required=True, max_length=400)
+            self.add_item(ti)
+            self.inputs.append(ti)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        key = (interaction.user.id, self.tid)
+        answers = list(APPLY_DRAFTS.get(key, [])) if self.page else []
+        answers += [(q, i.value) for q, i in zip(self.qs, self.inputs)]
+        if self.page + 1 < self.pages:
+            APPLY_DRAFTS[key] = answers
+            return await interaction.response.send_message(
+                f"✅ تم حفظ الجزء {self.page + 1}/{self.pages}. اضغط للمتابعة:",
+                view=ApplyNext(self.tid, self.page + 1), ephemeral=True)
+        APPLY_DRAFTS.pop(key, None)
+        await apply_submit(interaction, self.tid, answers)
+
+class ApplyNext(discord.ui.View):
+    def __init__(self, tid: str, page: int):
+        super().__init__(timeout=600)
+        self.tid, self.page = tid, page
+
+    @discord.ui.button(label="التالي", emoji="➡️", style=discord.ButtonStyle.primary)
+    async def nxt(self, interaction: discord.Interaction, button: discord.ui.Button):
+        t = conf(interaction.guild.id)["apply"]["types"].get(self.tid)
+        if not t or not t["open"]:
+            return await interaction.response.edit_message(content="🔒 التقديم مو متاح حالياً.", view=None)
+        await interaction.response.send_modal(ApplyModal(self.tid, t, self.page))
+
+async def apply_start(interaction: discord.Interaction, tid: str):
+    send = interaction.response.send_message
+    ap = conf(interaction.guild.id)["apply"]
+    t = ap["types"].get(tid)
+    if not t:
+        return await send("❌ هذا التقديم انحذف.", ephemeral=True)
+    if not t["open"]:
+        return await send("🔒 التقديم مغلق حالياً.", ephemeral=True)
+    if not t["questions"] or not interaction.guild.get_channel(t["channel"] or 0):
+        return await send("⚠️ التقديم ما انضبط بعد (روم المراجعة أو الأسئلة)، كلّم الإدارة.", ephemeral=True)
+    for s in ap["subs"].values():
+        if s["user"] == interaction.user.id and s["type"] == tid and s["status"] == "pending":
+            return await send("⏳ عندك تقديم قيد المراجعة، انتظر الرد.", ephemeral=True)
+    APPLY_DRAFTS.pop((interaction.user.id, tid), None)
+    await interaction.response.send_modal(ApplyModal(tid, t, 0))
+
+# ---------------------------------------------------------------- التقديم: المراجعة
+def apply_review_embed(t: dict, sid: str, sub: dict, user, accepted=None, by=None, note="") -> discord.Embed:
+    color = parse_color(t["color"]) if accepted is None else (C_OK if accepted else C_ERR)
+    e = discord.Embed(title=f"📋 تقديم — {t['name']}", color=color,
+                      timestamp=datetime.datetime.fromtimestamp(sub["time"], datetime.timezone.utc))
+    mention = getattr(user, "mention", f"<@{sub['user']}>")
+    e.description = f"**المتقدم:** {mention} (`{sub['user']}`)"
+    if user is not None:
+        e.set_thumbnail(url=user.display_avatar.url)
+        e.description += f"\n**الحساب أُنشئ:** <t:{int(user.created_at.timestamp())}:R>"
+    for q, a in sub["answers"]:
+        e.add_field(name=q[:100], value=(a[:1000] or "—"), inline=False)
+    if accepted is not None:
+        res = f"{'✅ مقبول' if accepted else '❌ مرفوض'} بواسطة <@{by}>"
+        if note:
+            res += f"\n**الملاحظة:** {note[:500]}"
+        e.add_field(name="النتيجة", value=res, inline=False)
+    e.set_footer(text=f"{BOT_NAME} • تقديم #{sid}")
+    return e
+
+async def apply_submit(interaction: discord.Interaction, tid: str, answers: list):
+    guild, ap = interaction.guild, conf(interaction.guild.id)["apply"]
+    t = ap["types"].get(tid)
+    ch = guild.get_channel(t["channel"] or 0) if t else None
+    if not t or not ch:
+        return await interaction.response.send_message("❌ ما قدرت أرسل التقديم (إعدادات ناقصة).", ephemeral=True)
+    ap["nsub"] += 1
+    sid = str(ap["nsub"])
+    sub = {"type": tid, "user": interaction.user.id, "answers": answers,
+           "status": "pending", "time": time.time(), "msg": None}
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(label="قبول", emoji="✅", style=discord.ButtonStyle.success,
+                                    custom_id=f"taqat:applyacc:{sid}"))
+    view.add_item(discord.ui.Button(label="رفض", emoji="❌", style=discord.ButtonStyle.danger,
+                                    custom_id=f"taqat:applyrej:{sid}"))
+    ping = f"<@&{t['reviewers']}>" if t.get("reviewers") else None
+    try:
+        msg = await ch.send(ping, embed=apply_review_embed(t, sid, sub, interaction.user), view=view,
+                            allowed_mentions=discord.AllowedMentions(roles=True))
+    except discord.HTTPException:
+        return await interaction.response.send_message(
+            "❌ ما قدرت أرسل لروم المراجعة (صلاحيات البوت).", ephemeral=True)
+    sub["msg"] = msg.id
+    ap["subs"][sid] = sub
+    apply_prune(ap)
+    save_data()
+    await interaction.response.send_message("✅ تم إرسال تقديمك، بيوصلك الرد بالخاص.", ephemeral=True)
+
+class ApplyRejectModal(discord.ui.Modal, title="سبب الرفض"):
+    reason = discord.ui.TextInput(label="السبب (اختياري)", style=discord.TextStyle.paragraph,
+                                  required=False, max_length=300)
+
+    def __init__(self, sid: str):
+        super().__init__()
+        self.sid = sid
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await apply_finish(interaction, self.sid, False, str(self.reason).strip())
+
+async def apply_review(interaction: discord.Interaction, accept: bool, sid: str):
+    send = interaction.response.send_message
+    ap = conf(interaction.guild.id)["apply"]
+    sub = ap["subs"].get(sid)
+    t = ap["types"].get(sub["type"]) if sub else None
+    if not sub or not t:
+        return await send("❌ ما لقيت بيانات هذا التقديم.", ephemeral=True)
+    m = interaction.user
+    if not (m.guild_permissions.manage_guild or (t.get("reviewers") and any(r.id == t["reviewers"] for r in m.roles))):
+        return await send("❌ ما عندك صلاحية مراجعة التقديمات.", ephemeral=True)
+    if sub["status"] != "pending":
+        return await send("ℹ️ هذا التقديم تمت مراجعته من قبل.", ephemeral=True)
+    if not accept:
+        return await interaction.response.send_modal(ApplyRejectModal(sid))
+    await apply_finish(interaction, sid, True, "")
+
+async def apply_finish(interaction: discord.Interaction, sid: str, accepted: bool, note: str):
+    guild, ap = interaction.guild, conf(interaction.guild.id)["apply"]
+    sub = ap["subs"].get(sid)
+    t = ap["types"].get(sub["type"]) if sub else None
+    if not sub or not t:
+        return await interaction.response.send_message("❌ ما لقيت بيانات هذا التقديم.", ephemeral=True)
+    if sub["status"] != "pending":
+        return await interaction.response.send_message("ℹ️ هذا التقديم تمت مراجعته من قبل.", ephemeral=True)
+    sub.update(status="accepted" if accepted else "rejected", by=interaction.user.id, note=note)
+    save_data()
+    member = guild.get_member(sub["user"])
+    user = member
+    if user is None:
+        try:
+            user = await bot.fetch_user(sub["user"])
+        except discord.HTTPException:
+            user = None
+    embed = apply_review_embed(t, sid, sub, user, accepted, interaction.user.id, note)
+    try:
+        await interaction.response.edit_message(embed=embed, view=None)
+    except Exception:
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=True)
+            if interaction.message:
+                await interaction.message.edit(embed=embed, view=None)
+        except Exception:
+            traceback.print_exc()
+    notes = []
+    if accepted and t.get("role") and member:
+        role = guild.get_role(t["role"])
+        if role:
+            try:
+                await member.add_roles(role, reason=f"قبول تقديم {t['name']}")
+            except discord.HTTPException:
+                notes.append("⚠️ ما قدرت أعطيه الرتبة (رتبة البوت لازم تكون أعلى منها).")
+    if user is not None:
+        dm = discord.Embed(
+            title="🎉 تم قبول تقديمك" if accepted else "❌ تم رفض تقديمك",
+            description=f"التقديم: **{t['name']}**\nالسيرفر: **{guild.name}**"
+                        + (f"\n\n**ملاحظة الإدارة:**\n{note}" if note else ""),
+            color=C_OK if accepted else C_ERR)
+        try:
+            await user.send(embed=dm)
+        except discord.HTTPException:
+            notes.append("⚠️ خاصه مقفل، ما وصله إشعار بالنتيجة.")
+    if notes:
+        try:
+            await interaction.followup.send("\n".join(notes), ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+# ---------------------------------------------------------------- التقديم: الأوامر الإدارية
+async def _apply_get(ctx, ref: str):
+    tid, t = apply_find(ctx.guild.id, ref)
+    if not t:
+        await send_err(ctx, f"ما لقيت تقديم بهذا الرقم/الاسم. اكتب `{PREFIX}apply list`.", "تقديم غير موجود")
+    return tid, t
+
+@bot.group(name="apply", aliases=["تقديم"], invoke_without_command=True,
+           help="نظام التقديم — تخصيص كامل (الاسم، الأسئلة، الصور، الرتب)")
+@staff_only
+async def apply_cmd(ctx):
+    P = PREFIX
+    await ctx.send(embed=info_e("📝 نظام التقديم", (
+        f"`{P}apply new <الاسم>` ← إنشاء تقديم (إدارة / ايفنت / أي اسم)\n"
+        f"`{P}apply channel <رقم> #روم` ← روم استقبال التقديمات\n"
+        f"`{P}apply questions <رقم> سؤال1 | سؤال2 | ...` ← الأسئلة (حتى 10)\n"
+        f"`{P}apply role <رقم> @رتبة` ← رتبة تنعطى عند القبول (`off` لإلغائها)\n"
+        f"`{P}apply reviewers <رقم> @رتبة` ← رتبة تقدر تقبل/ترفض\n"
+        f"`{P}apply text <رقم> title|desc|button|label <النص>` ← نصوص اللوحة\n"
+        f"`{P}apply image <رقم> top|bottom <رابط أو مرفق>` ← الصورة العلوية/السفلية (`off` لإزالتها)\n"
+        f"`{P}apply color <رقم> <هيكس>` ← لون الشريط\n"
+        f"`{P}apply open|close <رقم>` ← فتح/إغلاق التقديم\n"
+        f"`{P}apply panel <رقم>` ← إرسال لوحة التقديم هنا\n"
+        f"`{P}apply list` · `{P}apply show <رقم>` · `{P}apply delete <رقم>`")))
+
+@apply_cmd.command(name="new", aliases=["جديد"])
+@staff_only
+async def apply_new(ctx, *, name: str):
+    ap = conf(ctx.guild.id)["apply"]
+    if len(ap["types"]) >= 10:
+        return await send_err(ctx, "الحد الأقصى 10 تقديمات.", "وصلت الحد")
+    tid = str(ap["next"])
+    ap["next"] += 1
+    ap["types"][tid] = apply_default(name.strip()[:60])
+    save_data()
+    await ctx.send(embed=ok_e(f"تم إنشاء التقديم #{tid}", (
+        f"**{name}**\nالخطوات:\n1) `{PREFIX}apply channel {tid} #روم-المراجعة`\n"
+        f"2) `{PREFIX}apply questions {tid} سؤال | سؤال`  (اختياري)\n3) `{PREFIX}apply panel {tid}`")))
+
+@apply_cmd.command(name="list", aliases=["قائمة"])
+@staff_only
+async def apply_list(ctx):
+    ap = conf(ctx.guild.id)["apply"]
+    if not ap["types"]:
+        return await ctx.send(embed=info_e("📝 التقديمات", f"ما فيه تقديمات. ابدأ بـ `{PREFIX}apply new <الاسم>`"))
+    lines = []
+    for tid, t in ap["types"].items():
+        pend = sum(1 for s in ap["subs"].values() if s["type"] == tid and s["status"] == "pending")
+        ch = f"<#{t['channel']}>" if t["channel"] else "❌ بدون روم"
+        lines.append(f"**#{tid}** · {t['name']} · {'🟢 مفتوح' if t['open'] else '🔴 مغلق'} · {ch} · ⏳ {pend}")
+    await ctx.send(embed=info_e("📝 التقديمات", "\n".join(lines)))
+
+@apply_cmd.command(name="show", aliases=["عرض"])
+@staff_only
+async def apply_show(ctx, ref: str):
+    tid, t = await _apply_get(ctx, ref)
+    if not t:
+        return
+    e = info_e(f"📝 {t['name']} (#{tid})")
+    e.add_field(name="الحالة", value="🟢 مفتوح" if t["open"] else "🔴 مغلق")
+    e.add_field(name="روم المراجعة", value=f"<#{t['channel']}>" if t["channel"] else "—")
+    e.add_field(name="رتبة القبول", value=f"<@&{t['role']}>" if t["role"] else "—")
+    e.add_field(name="المراجعين", value=f"<@&{t['reviewers']}>" if t["reviewers"] else "إدارة السيرفر")
+    e.add_field(name="الأسئلة", inline=False,
+                value="\n".join(f"{i}. {q}" for i, q in enumerate(t["questions"], 1)) or "—")
+    await ctx.send(embed=e)
+
+@apply_cmd.command(name="delete", aliases=["حذف"])
+@staff_only
+async def apply_delete(ctx, ref: str):
+    tid, t = await _apply_get(ctx, ref)
+    if not t:
+        return
+    ap = conf(ctx.guild.id)["apply"]
+    ap["types"].pop(tid)
+    for k in [k for k, s in ap["subs"].items() if s["type"] == tid]:
+        ap["subs"].pop(k)
+    save_data()
+    await ctx.send(embed=ok_e("تم حذف التقديم", t["name"]))
+
+@apply_cmd.command(name="questions", aliases=["اسئلة", "أسئلة"])
+@staff_only
+async def apply_questions(ctx, ref: str, *, text: str):
+    tid, t = await _apply_get(ctx, ref)
+    if not t:
+        return
+    qs = [q.strip()[:200] for q in re.split(r"\||\n", nl(text)) if q.strip()]
+    if not 1 <= len(qs) <= 10:
+        return await send_err(ctx, "حط من سؤال إلى 10 أسئلة مفصولة بـ `|`.", "عدد الأسئلة")
+    t["questions"] = qs
+    save_data()
+    await ctx.send(embed=ok_e("تم حفظ الأسئلة", "\n".join(f"{i}. {q}" for i, q in enumerate(qs, 1))))
+
+@apply_cmd.command(name="channel", aliases=["روم"])
+@staff_only
+async def apply_channel(ctx, ref: str, channel: discord.TextChannel):
+    tid, t = await _apply_get(ctx, ref)
+    if not t:
+        return
+    t["channel"] = channel.id
+    save_data()
+    await ctx.send(embed=ok_e("روم استقبال التقديمات", channel.mention))
+
+async def _opt_role(ctx, value: str):
+    if _is_off(value):
+        return None, True
+    try:
+        return await commands.RoleConverter().convert(ctx, value), True
+    except commands.BadArgument:
+        await send_err(ctx, "ما لقيت الرتبة. استخدم المنشن أو `off`.", "رتبة غير موجودة")
+        return None, False
+
+@apply_cmd.command(name="role", aliases=["رتبة"])
+@staff_only
+async def apply_role(ctx, ref: str, *, value: str):
+    tid, t = await _apply_get(ctx, ref)
+    if not t:
+        return
+    role, ok = await _opt_role(ctx, value)
+    if not ok:
+        return
+    t["role"] = role.id if role else None
+    save_data()
+    await ctx.send(embed=ok_e("رتبة القبول", role.mention if role else "تم إلغاؤها"))
+
+@apply_cmd.command(name="reviewers", aliases=["مراجعين"])
+@staff_only
+async def apply_reviewers(ctx, ref: str, *, value: str):
+    tid, t = await _apply_get(ctx, ref)
+    if not t:
+        return
+    role, ok = await _opt_role(ctx, value)
+    if not ok:
+        return
+    t["reviewers"] = role.id if role else None
+    save_data()
+    await ctx.send(embed=ok_e("رتبة المراجعين", role.mention if role else "إدارة السيرفر فقط"))
+
+@apply_cmd.command(name="text", aliases=["نص"])
+@staff_only
+async def apply_text(ctx, ref: str, item: Literal["title", "desc", "button", "label"], *, value: str):
+    tid, t = await _apply_get(ctx, ref)
+    if not t:
+        return
+    t[item] = nl(value)[:1500 if item == "desc" else 100]
+    save_data()
+    await ctx.send(embed=ok_e("تم الحفظ", f"**{item}** ← {t[item]}\nأرسل اللوحة من جديد بـ `{PREFIX}apply panel {tid}`"))
+
+@apply_cmd.command(name="image", aliases=["صورة"])
+@staff_only
+async def apply_image_cmd(ctx, ref: str, where: Literal["top", "bottom"], url: Optional[str] = None):
+    tid, t = await _apply_get(ctx, ref)
+    if not t:
+        return
+    if url and _is_off(url):
+        t[where] = None
+        save_data()
+        return await ctx.send(embed=ok_e("تمت إزالة الصورة"))
+    att = ctx.message.attachments[0] if ctx.message.attachments else None
+    try:
+        t[where] = await store_image(ctx.guild.id, f"apply{tid}_{where}", att, url)
+    except ValueError as err:
+        return await send_err(ctx, str(err), "صورة غير صحيحة")
+    save_data()
+    await ctx.send(embed=ok_e("تم تغيير الصورة", f"أرسل اللوحة من جديد بـ `{PREFIX}apply panel {tid}`"))
+
+@apply_cmd.command(name="color", aliases=["لون"])
+@staff_only
+async def apply_color(ctx, ref: str, color: str):
+    tid, t = await _apply_get(ctx, ref)
+    if not t:
+        return
+    if not valid_color(color):
+        return await send_err(ctx, "اللون لازم هيكس مثل `C9A66B`.", "لون غير صحيح")
+    t["color"] = color.lstrip("#").upper()
+    save_data()
+    await ctx.send(embed=ok_e("تم تغيير اللون", f"`#{t['color']}`"))
+
+@apply_cmd.command(name="open", aliases=["فتح"])
+@staff_only
+async def apply_open(ctx, ref: str):
+    tid, t = await _apply_get(ctx, ref)
+    if t:
+        t["open"] = True
+        save_data()
+        await ctx.send(embed=ok_e("تم فتح التقديم", t["name"]))
+
+@apply_cmd.command(name="close", aliases=["اغلاق", "إغلاق"])
+@staff_only
+async def apply_close(ctx, ref: str):
+    tid, t = await _apply_get(ctx, ref)
+    if t:
+        t["open"] = False
+        save_data()
+        await ctx.send(embed=ok_e("تم إغلاق التقديم", t["name"]))
+
+@apply_cmd.command(name="panel", aliases=["لوحة"])
+@staff_only
+async def apply_panel_cmd(ctx, ref: str):
+    tid, t = await _apply_get(ctx, ref)
+    if not t:
+        return
+    if not t["channel"]:
+        await ctx.send(embed=warn_e("تنبيه", f"ما حددت روم المراجعة بعد: `{PREFIX}apply channel {tid} #روم`"))
+    await apply_send_panel(ctx.channel, tid, t)
+
+# ================================================================ نظام الافتارات (Respect / MT)
+AVT_WAIT: dict[int, float] = {}
+AVT_STATUS = {"online": (35, 165, 90), "idle": (240, 178, 50), "dnd": (242, 63, 66), "offline": (128, 132, 142)}
+AVT_DIR = os.path.join(IMG_DIR, "avt")      # الصور الأصلية للافتارات (للتحميل)
+
+def avt_is_staff(m) -> bool:
+    """عضو إداري = أدمن أو عنده إدارة السيرفر — افتاراته ما يحذفها غيره."""
+    return isinstance(m, discord.Member) and (
+        m.guild_permissions.administrator or m.guild_permissions.manage_guild)
+
+def avt_render_header(avatar: bytes, banner, status: str = "dnd"):
+    """يركّب صورة الهيدر: البنر + الافتار الدائري فوقه + نقطة الحالة (مثل بروفايل ديسكورد). يرجع JPEG أو None."""
+    try:
+        from PIL import Image, ImageDraw, ImageOps
+    except ImportError:
+        return None
+    W, BH, AV, RING, S = 1000, 380, 250, 20, 4
+    ay, ax = BH - int(AV * 0.62), 44
+    H = ay + AV + RING + 12
+    bg = (13, 13, 15)
+    av = ImageOps.exif_transpose(Image.open(io.BytesIO(avatar))).convert("RGBA")
+    if banner:
+        bn = ImageOps.fit(ImageOps.exif_transpose(Image.open(io.BytesIO(banner))).convert("RGB"),
+                          (W, BH), Image.LANCZOS)
+    else:
+        r, g_, b = av.convert("RGB").resize((1, 1), Image.LANCZOS).getpixel((0, 0))
+        bn = Image.new("RGB", (W, BH))
+        d = ImageDraw.Draw(bn)
+        for y in range(BH):
+            k = 0.85 - 0.6 * y / BH
+            d.line([(0, y), (W, y)], fill=(int(r * k), int(g_ * k), int(b * k)))
+    canvas = Image.new("RGB", (W, H), bg)
+    canvas.paste(bn, (0, 0))
+
+    def circle_mask(size):
+        m = Image.new("L", (size * S, size * S), 0)
+        ImageDraw.Draw(m).ellipse([0, 0, size * S - 1, size * S - 1], fill=255)
+        return m.resize((size, size), Image.LANCZOS)
+
+    ring = circle_mask(AV + 2 * RING)
+    canvas.paste(Image.new("RGB", ring.size, bg), (ax - RING, ay - RING), ring)
+    canvas.paste(ImageOps.fit(av, (AV, AV), Image.LANCZOS).convert("RGB"), (ax, ay), circle_mask(AV))
+
+    if status in AVT_STATUS:
+        r_in, r_out = 32, 46
+        cx, cy = ax + AV - 34, ay + AV - 34
+        ob = circle_mask(2 * r_out)
+        canvas.paste(Image.new("RGB", ob.size, bg), (cx - r_out, cy - r_out), ob)
+        dot = Image.new("RGBA", (2 * r_in * S, 2 * r_in * S), (0, 0, 0, 0))
+        dd = ImageDraw.Draw(dot)
+        c = r_in * S
+        dd.ellipse([0, 0, 2 * c - 1, 2 * c - 1], fill=AVT_STATUS[status] + (255,))
+        if status == "dnd":
+            dd.rounded_rectangle([c - int(c * .55), c - int(c * .17), c + int(c * .55), c + int(c * .17)],
+                                 radius=int(c * .17), fill=(255, 255, 255, 255))
+        elif status == "idle":
+            dd.ellipse([c - int(c * .95), c - int(c * 1.05), c + int(c * .15), c + int(c * .05)], fill=(0, 0, 0, 0))
+            dd.ellipse([c - int(c * .95), c - int(c * 1.05), c + int(c * .15), c + int(c * .05)], fill=bg + (255,))
+        elif status == "offline":
+            dd.ellipse([c - int(c * .5), c - int(c * .5), c + int(c * .5), c + int(c * .5)], fill=bg + (255,))
+        dot = dot.resize((2 * r_in, 2 * r_in), Image.LANCZOS)
+        canvas.paste(dot, (cx - r_in, cy - r_in), dot)
+    out = io.BytesIO()
+    canvas.save(out, "JPEG", quality=92)
+    return out.getvalue()
+
+def avt_panel_payload(guild: discord.Guild) -> dict:
+    ui = discord.ui
+    a = conf(guild.id)["avt"]
+    top, f1 = _media(a.get("top"), "avt_top")
+    low, f2 = _media(a.get("bottom"), "avt_bottom")
+    items = []
+    if top:
+        items.append(ui.MediaGallery(discord.MediaGalleryItem(top)))
+    items += [ui.TextDisplay(f"### {a['title']}"), ui.TextDisplay(a["desc"]), ui.Separator()]
+    items.append(ui.ActionRow(*[
+        ui.Button(label=n[:80], style=discord.ButtonStyle.secondary, custom_id=f"taqat:avtadd:{i}")
+        for i, n in enumerate(a["servers"])]))
+    if low:
+        items += [ui.Separator(), ui.MediaGallery(discord.MediaGalleryItem(low))]
+    view = ui.LayoutView(timeout=None)
+    view.add_item(ui.Container(*items, accent_colour=discord.Colour(parse_color(a["color"]))))
+    return {"view": view, "files": [f for f in (f1, f2) if f],
+            "allowed_mentions": discord.AllowedMentions.none()}
+
+async def avt_publish(guild: discord.Guild, member: discord.Member, server: str, name: str,
+                      avatar: discord.Attachment, banner):
+    ui = discord.ui
+    a = conf(guild.id)["avt"]
+    key = next((n for n in a["servers"] if n.lower() == server.strip().lower()), None)
+    if key is None:
+        raise ValueError("السيرفر غير موجود. المتاح: " + "، ".join(a["servers"]))
+    cid = a["servers"].get(key) or a["channel"]
+    ch = guild.get_channel(cid) if cid else None
+    if not ch:
+        raise ValueError(f"روم الافتارات غير محدد، قل للإدارة تستخدم `{PREFIX}avtset channel`.")
+    for att in (avatar, banner):
+        if att is None:
+            continue
+        if not (att.content_type or "").startswith("image/"):
+            raise ValueError("الملفات لازم تكون صور.")
+        if att.size > 8 * 1024 * 1024:
+            raise ValueError("حجم الصورة أكبر من 8MB.")
+    name = name.strip()[:40] or member.display_name
+    ab = await avatar.read()
+    bb = await banner.read() if banner else None
+    try:
+        header = await asyncio.to_thread(avt_render_header, ab, bb, a["status"])
+    except Exception:
+        traceback.print_exc()
+        header = None
+    if header is None:
+        print("[avt] Pillow غير مثبتة — أضف سطر Pillow في requirements.txt عشان يطلع التصميم الدائري")
+    ea = os.path.splitext(avatar.filename)[1] or ".png"
+    eb = (os.path.splitext(banner.filename)[1] or ".png") if banner else ""
+
+    files, items = [], []
+    if header:
+        files.append(discord.File(io.BytesIO(header), filename="header.jpg"))
+        items += [ui.MediaGallery(discord.MediaGalleryItem("attachment://header.jpg")),
+                  ui.TextDisplay(f"## {name}\n-# {key}")]
+    else:            # بدون Pillow: البنر + الافتار على الجنب
+        files.append(discord.File(io.BytesIO(ab), filename=f"avatar{ea}"))
+        if bb:
+            files.append(discord.File(io.BytesIO(bb), filename=f"banner{eb}"))
+            items.append(ui.MediaGallery(discord.MediaGalleryItem(f"attachment://banner{eb}")))
+        items.append(ui.Section(ui.TextDisplay(f"## {name}\n-# {key}"),
+                                accessory=ui.Thumbnail(f"attachment://avatar{ea}")))
+    items.append(ui.TextDisplay(f"by: {member.display_name}"))
+    view = ui.LayoutView(timeout=None)
+    view.add_item(ui.Container(*items, accent_colour=discord.Colour(parse_color(a["color"]))))
+    view.add_item(ui.ActionRow(
+        ui.Button(emoji="📥", style=discord.ButtonStyle.secondary, custom_id="taqat:avtdl"),
+        ui.Button(emoji="🗑️", style=discord.ButtonStyle.secondary, custom_id=f"taqat:avtdel:{member.id}")))
+    post = await ch.send(view=view, files=files, allowed_mentions=discord.AllowedMentions.none())
+
+    # نحفظ الصور الأصلية عندنا — زر التحميل يرسلها من هنا (ما يعتمد على مرفقات الرسالة)
+    os.makedirs(AVT_DIR, exist_ok=True)
+    rec = {"owner": member.id, "name": name, "avatar": None, "banner": None}
+    p = os.path.join(AVT_DIR, f"{post.id}_avatar{ea}")
+    with open(p, "wb") as f:
+        f.write(ab)
+    rec["avatar"] = p
+    if bb:
+        p = os.path.join(AVT_DIR, f"{post.id}_banner{eb}")
+        with open(p, "wb") as f:
+            f.write(bb)
+        rec["banner"] = p
+    a["posts"][str(post.id)] = rec
+    for k in list(a["posts"])[:-300]:          # نحتفظ بآخر 300 فقط
+        old = a["posts"].pop(k)
+        for fp in (old.get("avatar"), old.get("banner")):
+            if fp and os.path.exists(fp):
+                os.remove(fp)
+    save_data()
+    return post
+
+class AvtNameModal(discord.ui.Modal):
+    def __init__(self, server: str):
+        super().__init__(title=f"افتار جديد — {server}"[:45])
+        self.server = server
+        self.name_in = discord.ui.TextInput(label="اسم الشخصية", max_length=40, placeholder="مثال: Calm Avt")
+        self.add_item(self.name_in)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await avt_wait_upload(interaction, self.server, self.name_in.value.strip())
+
+async def avt_start(interaction: discord.Interaction, idx: str):
+    names = list(conf(interaction.guild.id)["avt"]["servers"])
+    try:
+        server = names[int(idx)]
+    except (ValueError, IndexError):
+        return await interaction.response.send_message(
+            "❌ هذا الزر قديم، اطلب من الإدارة ترسل اللوحة من جديد.", ephemeral=True)
+    await interaction.response.send_modal(AvtNameModal(server))
+
+async def avt_wait_upload(interaction: discord.Interaction, server: str, name: str):
+    user, ch = interaction.user, interaction.channel
+    if time.time() - AVT_WAIT.get(user.id, 0) < 130:
+        return await interaction.response.send_message("⏳ عندك رفع شغال، كمّله أول.", ephemeral=True)
+    AVT_WAIT[user.id] = time.time()
+    await interaction.response.send_message(
+        f"📤 **{name}** — **{server}**\nأرسل الحين صورة الافتار في هذا الروم خلال دقيقتين.\n"
+        "لو تبي بنر، أرسل صورتين في نفس الرسالة (الأولى الافتار والثانية البنر).\n"
+        "لو الروم مقفل عليك استخدم الأمر `/avt`.", ephemeral=True)
+
+    def check(m: discord.Message):
+        return (m.author.id == user.id and m.channel.id == ch.id
+                and any((a.content_type or "").startswith("image/") for a in m.attachments))
+    try:
+        m = await bot.wait_for("message", check=check, timeout=120)
+    except asyncio.TimeoutError:
+        AVT_WAIT.pop(user.id, None)
+        return await interaction.followup.send("⌛ انتهى الوقت، اضغط الزر من جديد.", ephemeral=True)
+    imgs = [a for a in m.attachments if (a.content_type or "").startswith("image/")]
+    try:
+        post = await avt_publish(interaction.guild, user, server, name, imgs[0], imgs[1] if len(imgs) > 1 else None)
+        await interaction.followup.send(f"✅ تم النشر: {post.jump_url}", ephemeral=True)
+    except ValueError as err:
+        await interaction.followup.send(f"❌ {err}", ephemeral=True)
+    except discord.HTTPException:
+        traceback.print_exc()
+        await interaction.followup.send("❌ ما قدرت أنشر (صلاحيات البوت في روم الافتارات).", ephemeral=True)
+    finally:
+        AVT_WAIT.pop(user.id, None)
+        try:
+            await m.delete()
+        except discord.HTTPException:
+            pass
+
+async def avt_download(interaction: discord.Interaction):
+    msg = interaction.message
+    a = conf(interaction.guild.id)["avt"]
+    rec = a["posts"].get(str(msg.id)) if msg else None
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    files = []
+    if rec:
+        for k in ("avatar", "banner"):
+            p = rec.get(k)
+            if p and os.path.exists(p):
+                files.append(discord.File(p, filename=f"{k}{os.path.splitext(p)[1]}"))
+    if not files and msg:                      # افتارات قديمة قبل التعديل
+        for att in msg.attachments:
+            if att.filename.startswith(("avatar", "banner", "header")):
+                files.append(await att.to_file())
+    if not files:
+        return await interaction.followup.send(
+            "❌ ما لقيت الملفات (الافتار قديم أو انحذفت صوره).", ephemeral=True)
+    await interaction.followup.send("📥 تحميلك جاهز:", files=files, ephemeral=True)
+
+class AvtConfirm(discord.ui.View):
+    def __init__(self, message: discord.Message):
+        super().__init__(timeout=30)
+        self.message = message
+
+    @discord.ui.button(label="تأكيد الحذف", emoji="🗑️", style=discord.ButtonStyle.danger)
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await self.message.delete()
+        except discord.HTTPException:
+            return await interaction.response.edit_message(content="❌ ما قدرت أحذفه.", view=None)
+        rec = conf(interaction.guild.id)["avt"]["posts"].pop(str(self.message.id), None) or {}
+        for fp in (rec.get("avatar"), rec.get("banner")):
+            if fp and os.path.exists(fp):
+                os.remove(fp)
+        save_data()
+        await interaction.response.edit_message(content="✅ تم الحذف.", view=None)
+
+async def avt_delete(interaction: discord.Interaction, owner_id: int):
+    u = interaction.user
+    if u.id != owner_id:
+        owner = interaction.guild.get_member(owner_id)
+        if owner and avt_is_staff(owner):
+            return await interaction.response.send_message(
+                "🛡️ هذا افتار أحد الإدارة، ما يحذفه غير صاحبه.", ephemeral=True)
+        if not u.guild_permissions.manage_messages:
+            return await interaction.response.send_message(
+                "❌ بس صاحب الافتار أو الإدارة يقدر يحذفه.", ephemeral=True)
+    await interaction.response.send_message("🗑️ متأكد تبي تحذف هذا الافتار؟",
+                                            view=AvtConfirm(interaction.message), ephemeral=True)
+
+@bot.hybrid_command(name="avt", description="انشر افتار شخصيتك (Respect / MT) مع بنر اختياري")
+@commands.guild_only()
+@commands.cooldown(1, 20, commands.BucketType.user)
+async def avt_cmd(ctx, server: str, avatar: discord.Attachment, name: str,
+                  banner: Optional[discord.Attachment] = None):
+    """الاستخدام: /avt  أو  !avt Respect "اسم الشخصية" مع مرفق الافتار (ومرفق ثاني للبنر)"""
+    if ctx.interaction:
+        await ctx.defer(ephemeral=True)
+    try:
+        post = await avt_publish(ctx.guild, ctx.author, server, name, avatar, banner)
+    except ValueError as err:
+        return await send_err(ctx, str(err), "ما قدرت أنشر")
+    except discord.HTTPException:
+        traceback.print_exc()
+        return await send_err(ctx, "ما قدرت أنشر (صلاحيات البوت في روم الافتارات).", "ما قدرت أنشر")
+    await ctx.send(embed=ok_e("تم النشر", post.jump_url), ephemeral=True)
+
+@avt_cmd.autocomplete("server")
+async def avt_server_ac(interaction: discord.Interaction, current: str):
+    if not interaction.guild:
+        return []
+    names = conf(interaction.guild.id)["avt"]["servers"]
+    return [discord.app_commands.Choice(name=n, value=n) for n in names if current.lower() in n.lower()][:25]
+
+@bot.group(name="avtset", aliases=["اعدادات_افتار"], invoke_without_command=True,
+           help="إعدادات نظام الافتارات")
+@staff_only
+async def avtset_cmd(ctx):
+    P = PREFIX
+    await ctx.send(embed=info_e("🖼️ نظام الافتارات", (
+        f"`{P}avtset servers Respect MT` ← أسماء السيرفرات (حتى 5)\n"
+        f"`{P}avtset channel Respect #روم` ← روم نشر افتارات سيرفر معيّن\n"
+        f"`{P}avtset channel #روم` ← روم افتراضي لكل السيرفرات\n"
+        f"`{P}avtset text title|desc <النص>` ← نصوص اللوحة\n"
+        f"`{P}avtset image top|bottom <رابط أو مرفق>` ← صورة اللوحة العلوية/السفلية (`off` للإزالة)\n"
+        f"`{P}avtset color <هيكس>` · `{P}avtset status online|idle|dnd|offline`\n"
+        f"`{P}avtset panel` ← إرسال اللوحة هنا · `{P}avtset show`\n\n"
+        "الأعضاء ينشرون من أزرار اللوحة، أو بأمر `/avt` (مع مرفقات).")))
+
+@avtset_cmd.command(name="servers", aliases=["سيرفرات"])
+@staff_only
+async def avtset_servers(ctx, *names: str):
+    names = list(dict.fromkeys(n.strip()[:30] for n in names if n.strip()))
+    if not 1 <= len(names) <= 5:
+        return await send_err(ctx, f"اكتب من اسم إلى 5 أسماء، مثال: `{PREFIX}avtset servers Respect MT`", "عدد الأسماء")
+    a = conf(ctx.guild.id)["avt"]
+    a["servers"] = {n: a["servers"].get(n) for n in names}
+    save_data()
+    await ctx.send(embed=ok_e("السيرفرات", "، ".join(names) + f"\nأرسل اللوحة من جديد بـ `{PREFIX}avtset panel`"))
+
+@avtset_cmd.command(name="channel", aliases=["روم"])
+@staff_only
+async def avtset_channel(ctx, first: str, second: Optional[discord.TextChannel] = None):
+    a = conf(ctx.guild.id)["avt"]
+    if second is None:
+        try:
+            ch = await commands.TextChannelConverter().convert(ctx, first)
+        except commands.BadArgument:
+            return await send_err(ctx, "ما لقيت الروم.", "روم غير موجود")
+        a["channel"] = ch.id
+        save_data()
+        return await ctx.send(embed=ok_e("الروم الافتراضي للافتارات", ch.mention))
+    key = next((n for n in a["servers"] if n.lower() == first.lower()), None)
+    if key is None:
+        return await send_err(ctx, "السيرفر غير موجود. المتاح: " + "، ".join(a["servers"]), "سيرفر غير موجود")
+    a["servers"][key] = second.id
+    save_data()
+    await ctx.send(embed=ok_e(f"روم افتارات {key}", second.mention))
+
+@avtset_cmd.command(name="text", aliases=["نص"])
+@staff_only
+async def avtset_text(ctx, item: Literal["title", "desc"], *, value: str):
+    conf(ctx.guild.id)["avt"][item] = nl(value)[:1500 if item == "desc" else 100]
+    save_data()
+    await ctx.send(embed=ok_e("تم الحفظ", f"أرسل اللوحة من جديد بـ `{PREFIX}avtset panel`"))
+
+@avtset_cmd.command(name="image", aliases=["صورة"])
+@staff_only
+async def avtset_image(ctx, where: Literal["top", "bottom"], url: Optional[str] = None):
+    a = conf(ctx.guild.id)["avt"]
+    if url and _is_off(url):
+        a[where] = None
+        save_data()
+        return await ctx.send(embed=ok_e("تمت إزالة الصورة"))
+    att = ctx.message.attachments[0] if ctx.message.attachments else None
+    try:
+        a[where] = await store_image(ctx.guild.id, f"avt_{where}", att, url)
+    except ValueError as err:
+        return await send_err(ctx, str(err), "صورة غير صحيحة")
+    save_data()
+    await ctx.send(embed=ok_e("تم تغيير الصورة", f"أرسل اللوحة من جديد بـ `{PREFIX}avtset panel`"))
+
+@avtset_cmd.command(name="color", aliases=["لون"])
+@staff_only
+async def avtset_color(ctx, color: str):
+    if not valid_color(color):
+        return await send_err(ctx, "اللون لازم هيكس مثل `C9A66B`.", "لون غير صحيح")
+    conf(ctx.guild.id)["avt"]["color"] = color.lstrip("#").upper()
+    save_data()
+    await ctx.send(embed=ok_e("تم تغيير اللون"))
+
+@avtset_cmd.command(name="status", aliases=["حالة"])
+@staff_only
+async def avtset_status(ctx, status: Literal["online", "idle", "dnd", "offline", "off"]):
+    conf(ctx.guild.id)["avt"]["status"] = status
+    save_data()
+    await ctx.send(embed=ok_e("نقطة الحالة", status))
+
+@avtset_cmd.command(name="panel", aliases=["لوحة"])
+@staff_only
+async def avtset_panel(ctx):
+    try:
+        await ctx.channel.send(**avt_panel_payload(ctx.guild))
+    except Exception:
+        traceback.print_exc()
+        await send_err(ctx, "ما قدرت أرسل اللوحة. تأكد إن مكتبة discord.py محدثة.", "فشل الإرسال")
+
+@avtset_cmd.command(name="show", aliases=["عرض"])
+@staff_only
+async def avtset_show(ctx):
+    a = conf(ctx.guild.id)["avt"]
+    lines = [f"**{n}** ← " + (f"<#{c}>" if c else "الروم الافتراضي") for n, c in a["servers"].items()]
+    lines.append(f"\nالروم الافتراضي: {'<#%s>' % a['channel'] if a['channel'] else '—'}")
+    lines.append(f"نقطة الحالة: `{a['status']}`")
+    await ctx.send(embed=info_e("🖼️ إعدادات الافتارات", "\n".join(lines)))
+
+# ================================================================ موجّه أزرار التقديم والافتارات
+@bot.listen("on_interaction")
+async def taqat_components(interaction: discord.Interaction):
+    if interaction.type is not discord.InteractionType.component or not interaction.guild:
+        return
+    cid = str((interaction.data or {}).get("custom_id", ""))
+    if not cid.startswith("taqat:"):
+        return
+    p = cid.split(":")
+    kind, arg = (p[1] if len(p) > 1 else ""), (p[2] if len(p) > 2 else "")
+    try:
+        if kind == "apply":
+            await apply_start(interaction, arg)
+        elif kind == "applyacc":
+            await apply_review(interaction, True, arg)
+        elif kind == "applyrej":
+            await apply_review(interaction, False, arg)
+        elif kind == "avtadd":
+            await avt_start(interaction, arg)
+        elif kind == "avtdl":
+            await avt_download(interaction)
+        elif kind == "avtdel":
+            await avt_delete(interaction, int(arg))
+    except Exception:
+        traceback.print_exc()
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("❌ صار خطأ غير متوقع.", ephemeral=True)
+            else:
+                await interaction.response.send_message("❌ صار خطأ غير متوقع.", ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+if __name__ == "__main__":
+    if not TOKEN:
+        raise SystemExit("حط التوكن في ملف .env: DISCORD_TOKEN=xxxx")
+    bot.run(TOKEN)
