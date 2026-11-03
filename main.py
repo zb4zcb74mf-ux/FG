@@ -6010,17 +6010,24 @@ async def bank_set(ctx, member: discord.Member, amount: int):
 async def bank_reset(ctx, confirmation: str):
     if confirmation.lower() not in ("all", "الكل"):
         return await send_err(ctx, f"لتصفير أرصدة الجميع اكتب: `{PREFIX}bank reset all`")
-    economy(ctx.guild.id)["users"] = {}
+    users = economy(ctx.guild.id)["users"]
+    for data in users.values():
+        data["cash"] = 0
+        data["bank"] = 0
+        data["shares"] = 0
     save_data()
-    await ctx.send(embed=ok_e("تم تصفير البنك", "تمت إعادة أرصدة جميع الأعضاء إلى الصفر/رصيد البداية عند أول استخدام."))
+    await ctx.send(embed=ok_e("تم تصفير البنك", "تم تصفير المحفظة والبنك والأسهم لجميع الأعضاء المسجلين."))
 
 @bank_cmd.command(name="resetuser", aliases=["تصفير"])
 @commands.guild_only()
 @commands.has_permissions(manage_guild=True)
 async def bank_reset_user(ctx, member: discord.Member):
-    economy(ctx.guild.id)["users"].pop(str(member.id), None)
+    u = wallet(ctx.guild.id, member.id)
+    u["cash"] = 0
+    u["bank"] = 0
+    u["shares"] = 0
     save_data()
-    await ctx.send(embed=ok_e("تم تصفير رصيد العضو", f"تمت إعادة حساب {member.mention} إلى الرصيد الافتراضي."))
+    await ctx.send(embed=ok_e("تم تصفير رصيد العضو", f"تم تصفير محفظة وبنك وأسهم {member.mention}."))
 
 @bot.command(name="deposit", aliases=["ايداع", "إيداع"])
 @commands.guild_only()
