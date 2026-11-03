@@ -718,10 +718,11 @@ async def run_shortcut(message: discord.Message) -> bool:
     if (message.author.bot or not message.guild or not message.content
             or len(message.content) > 300 or not isinstance(message.author, discord.Member)):
         return False
-    if not conf(message.guild.id)["shortcuts"]["enabled"]:
+    text = message.content.strip()
+    economy_text = re.match(r"^(?:-اعداد|نهب\\s+.+|توب|بنك(?:\\s+.+)?|يومي|السوق|استثمار\\s+\\d+|ايداع\\s+\\d+|إيداع\\s+\\d+|سحب\\s+\\d+|تحويل\\s+.+|تداول\\s+(?:شراء|بيع)\\s+\\d+)$", text)
+    if not conf(message.guild.id)["shortcuts"]["enabled"] and not economy_text:
         return False
 
-    text = message.content.strip()
 
     # إعدادات البنك فقط تستخدم الشرطة، وباقي أوامر الاقتصاد تُكتب مباشرة.
     if text == "-اعداد":
