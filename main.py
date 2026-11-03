@@ -13,11 +13,19 @@ from typing import Literal, Optional
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
+from openai import AsyncOpenAI
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 PREFIX = os.getenv("PREFIX", "!")
 BOT_NAME = "Taqat"
+
+# Vale AI — يرد عند منشن البوت، وسياق منفصل لكل عضو وقناة
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+vale_ai = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+VALE_MODEL = os.getenv("VALE_MODEL", "gpt-4o-mini")
+VALE_HISTORY = {}
+VALE_HISTORY_LIMIT = 12
 COLOR = 0x2B8CFF
 DATA_FILE = "data.json"
 IMG_DIR = "images"
@@ -782,6 +790,71 @@ async def on_message(message: discord.Message):
     if await run_shortcut(message):
         return
     await bot.process_commands(message)
+
+@bot.listen("on_message")
+async def vale_ai_listener(message: discord.Message):
+    # لا يتفاعل مع رسائل البوتات أو الرسائل الخاصة
+    if message.author.bot or not message.guild or not bot.user:
+        return
+    if bot.user not in message.mentions:
+        return
+
+    # لا يجيب على منشن فارغ
+    prompt = re.sub(r"<@!?"+str(bot.user.id)+r">", "", message.content).strip()
+    if not prompt:
+        return
+
+    if vale_ai is None:
+        return await message.reply(
+            "خدمة Vale AI غير مفعّلة حاليًا. يحتاج مسؤول البوت إضافة OPENAI_API_KEY في متغيرات Railway.",
+            mention_author=False
+        )
+
+    key = (message.guild.id, message.channel.id, message.author.id)
+    history = VALE_HISTORY.setdefault(key, [])
+    history.append({"role": "user", "content": prompt})
+    history[:] = history[-VALE_HISTORY_LIMIT:]
+
+    try:
+        async with message.channel.typing():
+            result = await vale_ai.chat.completions.create(
+                model=VALE_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "أنت Vale AI، مساعد ودود داخل ديسكورد. "
+                            "تحدث بالعربية الطبيعية واللهجة السعودية عند ملاءمتها، "
+                            "وافهم العربية والإنجليزية. أجب بوضوح واختصار، "
+                            "ولا تدّع امتلاك صلاحيات أو تنفيذ أفعال داخل ديسكورد."
+                        )
+                    },
+                    *history
+                ],
+                max_tokens=700,
+                temperature=0.7
+            )
+        answer = (result.choices[0].message.content or "").strip()
+        if not answer:
+            answer = "ما قدرت أجهز رد مناسب، جرّب تسألني مرة ثانية."
+        history.append({"role": "assistant", "content": answer})
+        history[:] = history[-VALE_HISTORY_LIMIT:]
+        # تقسيم الرد الطويل حتى لا يتجاوز حد رسائل ديسكورد
+        for start in range(0, len(answer), 1900):
+            chunk = answer[start:start + 1900]
+            if start == 0:
+                await message.reply(chunk, mention_author=False)
+            else:
+                await message.channel.send(chunk)
+    except Exception:
+        traceback.print_exc()
+        # احذف رسالة المستخدم الأخيرة حتى لا يبقى سياق ناقص
+        if history and history[-1].get("role") == "user":
+            history.pop()
+        await message.reply(
+            "صار خطأ وأنا أجهز الرد. تأكد من إعداد مفتاح OpenAI API وحاول مرة ثانية.",
+            mention_author=False
+        )
 
 @bot.hybrid_command(name="shortcuts", aliases=["اختصارات"], description="عرض / تشغيل / إيقاف الاختصارات العربية")
 @commands.guild_only()
