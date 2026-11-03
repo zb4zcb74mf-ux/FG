@@ -2436,7 +2436,7 @@ async def points_cmd(ctx, member: discord.Member = None):
         e.add_field(name="⭐ متوسط التقييم", value=f"{avg:.1f} / 5  ({p['rating_count']} تقييم)")
     await ctx.send(embed=e)
 
-@bot.hybrid_command(name="topstaff", aliases=["توب", "ترتيب_الدعم"], description="ترتيب أفضل أعضاء الدعم بالنقاط")
+@bot.hybrid_command(name="topstaff", aliases=["ترتيب_الدعم"], description="ترتيب أفضل أعضاء الدعم بالنقاط")
 @commands.guild_only()
 async def topstaff(ctx):
     order = points_order(ctx.guild.id)[:10]
