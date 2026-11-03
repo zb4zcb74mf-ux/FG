@@ -719,7 +719,7 @@ async def run_shortcut(message: discord.Message) -> bool:
             or len(message.content) > 300 or not isinstance(message.author, discord.Member)):
         return False
     text = message.content.strip()
-    economy_text = re.match(r"^(?:-اعداد|نهب\\s+.+|توب|بنك(?:\\s+.+)?|يومي|السوق|استثمار\\s+\\d+|ايداع\\s+\\d+|إيداع\\s+\\d+|سحب\\s+\\d+|تحويل\\s+.+|تداول\\s+(?:شراء|بيع)\\s+\\d+)$", text)
+    economy_text = re.match(r"^(?:-اعداد|نهب\s+.+|توب|بنك(?:\s+.+)?|يومي|السوق|استثمار\s+\d+|ايداع\s+\d+|إيداع\s+\d+|سحب\s+\d+|تحويل\s+.+|تداول\s+(?:شراء|بيع)\s+\d+)$", text)
     if not conf(message.guild.id)["shortcuts"]["enabled"] and not economy_text:
         return False
 
@@ -736,17 +736,17 @@ async def run_shortcut(message: discord.Message) -> bool:
         return True
 
     direct = [
-        (r"^نهب\\s+(<@!?\\d{15,22}>|\\d{15,22})$", "rob"),
+        (r"^نهب\s+(<@!?\d{15,22}>|\d{15,22})$", "rob"),
         (r"^توب$", "top"),
-        (r"^بنك(?:\\s+(<@!?\\d{15,22}>|\\d{15,22}))?$", "bank"),
+        (r"^بنك(?:\s+(<@!?\d{15,22}>|\d{15,22}))?$", "bank"),
         (r"^يومي$", "daily"),
         (r"^السوق$", "market"),
-        (r"^استثمار\\s+(\\d+)$", "invest"),
-        (r"^ايداع\\s+(\\d+)$", "deposit"),
-        (r"^إيداع\\s+(\\d+)$", "deposit"),
-        (r"^سحب\\s+(\\d+)$", "withdraw"),
-        (r"^تحويل\\s+(<@!?\\d{15,22}>|\\d{15,22})\\s+(\\d+)$", "pay"),
-        (r"^تداول\\s+(شراء|بيع)\\s+(\\d+)$", "trade"),
+        (r"^استثمار\s+(\d+)$", "invest"),
+        (r"^ايداع\s+(\d+)$", "deposit"),
+        (r"^إيداع\s+(\d+)$", "deposit"),
+        (r"^سحب\s+(\d+)$", "withdraw"),
+        (r"^تحويل\s+(<@!?\d{15,22}>|\d{15,22})\s+(\d+)$", "pay"),
+        (r"^تداول\s+(شراء|بيع)\s+(\d+)$", "trade"),
     ]
     invoked_line = None
     for pattern, command_name in direct:
