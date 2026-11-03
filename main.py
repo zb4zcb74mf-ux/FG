@@ -722,6 +722,61 @@ async def run_shortcut(message: discord.Message) -> bool:
         return False
 
     text = message.content.strip()
+
+    # إعدادات البنك فقط تستخدم الشرطة، وباقي أوامر الاقتصاد تُكتب مباشرة.
+    if text == "-اعداد":
+        if not message.author.guild_permissions.manage_guild:
+            await message.channel.send(embed=err_e("تحتاج صلاحية إدارة السيرفر لفتح إعدادات البنك."))
+            return True
+        e = fancy("⚙️ إعدادات البنك", color=C_INFO,
+                  desc="اختر الإجراء من الأزرار بالأسفل. هذه اللوحة خاصة بالإدارة.")
+        e.add_field(name="إدارة الأرصدة", value="إضافة رصيد • تعديل رصيد عضو • تصفير جميع الأرصدة", inline=False)
+        await message.channel.send(embed=e, view=EconomyAdminView())
+        return True
+
+    direct = [
+        (r"^نهب\\s+(<@!?\\d{15,22}>|\\d{15,22})$", "rob"),
+        (r"^توب$", "top"),
+        (r"^بنك(?:\\s+(<@!?\\d{15,22}>|\\d{15,22}))?$", "bank"),
+        (r"^يومي$", "daily"),
+        (r"^السوق$", "market"),
+        (r"^استثمار\\s+(\\d+)$", "invest"),
+        (r"^ايداع\\s+(\\d+)$", "deposit"),
+        (r"^إيداع\\s+(\\d+)$", "deposit"),
+        (r"^سحب\\s+(\\d+)$", "withdraw"),
+        (r"^تحويل\\s+(<@!?\\d{15,22}>|\\d{15,22})\\s+(\\d+)$", "pay"),
+        (r"^تداول\\s+(شراء|بيع)\\s+(\\d+)$", "trade"),
+    ]
+    invoked_line = None
+    for pattern, command_name in direct:
+        match = re.match(pattern, text)
+        if not match:
+            continue
+        if command_name == "trade":
+            action = "buy" if match.group(1) == "شراء" else "sell"
+            invoked_line = f"{command_name} {action} {match.group(2)}"
+        elif command_name == "pay":
+            invoked_line = f"pay {match.group(1)} {match.group(2)}"
+        elif command_name == "rob":
+            invoked_line = f"rob {match.group(1)}"
+        elif command_name == "bank":
+            invoked_line = f"bank {match.group(1)}" if match.group(1) else "bank"
+        elif command_name in ("invest", "deposit", "withdraw"):
+            invoked_line = f"{command_name} {match.group(1)}"
+        else:
+            invoked_line = command_name
+        break
+    if invoked_line:
+        original = message.content
+        message.content = f"{PREFIX}{invoked_line}"
+        try:
+            ctx = await bot.get_context(message)
+        finally:
+            message.content = original
+        if ctx.valid:
+            await bot.invoke(ctx)
+        return True
+
     norm = _norm(text)
     hit = None
     for kw, pat in SHORTCUT_PATTERNS:
@@ -6169,6 +6224,85 @@ async def economy_top(ctx):
     rows.sort(key=lambda x: x[0], reverse=True)
     lines = [f"**{i}.** {m.mention} — **{money_text(total)}**" for i, (total, m) in enumerate(rows[:10], 1)]
     await ctx.send(embed=info_e("🏆 أغنى الأعضاء", "\n".join(lines) if lines else "ما فيه أرصدة مسجلة للحين."))
+
+
+class EconomyAmountModal(discord.ui.Modal):
+    def __init__(self, mode: str):
+        self.mode = mode
+        title = "إضافة رصيد لعضو" if mode == "give" else "تعديل رصيد عضو"
+        super().__init__(title=title)
+        self.member_input = discord.ui.TextInput(
+            label="منشن العضو أو الآيدي",
+            placeholder="@العضو أو 123456789012345678",
+            required=True,
+            max_length=30
+        )
+        self.amount_input = discord.ui.TextInput(
+            label="المبلغ",
+            placeholder="مثال: 5000",
+            required=True,
+            max_length=12
+        )
+        self.add_item(self.member_input)
+        self.add_item(self.amount_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild or not interaction.user.guild_permissions.manage_guild:
+            return await interaction.response.send_message("ما عندك صلاحية إدارة أرصدة البنك.", ephemeral=True)
+        raw_member = self.member_input.value.strip()
+        found = re.search(r"\\d{15,22}", raw_member)
+        amount_text = self.amount_input.value.strip().replace(",", "")
+        if not found or not amount_text.isdigit():
+            return await interaction.response.send_message("تأكد من منشن العضو أو الآيدي والمبلغ.", ephemeral=True)
+        member = interaction.guild.get_member(int(found.group()))
+        amount = int(amount_text)
+        if not member or member.bot or amount < 0 or amount > 1_000_000_000:
+            return await interaction.response.send_message("العضو أو المبلغ غير صالح.", ephemeral=True)
+        data = wallet(interaction.guild.id, member.id)
+        if self.mode == "give":
+            if amount == 0:
+                return await interaction.response.send_message("اكتب مبلغًا أكبر من صفر.", ephemeral=True)
+            data["cash"] += amount
+            title = "تمت إضافة الرصيد"
+        else:
+            data["cash"] = amount
+            title = "تم تعديل الرصيد"
+        save_data()
+        await interaction.response.send_message(
+            embed=ok_e(title, f"رصيد محفظة {member.mention}: **{money_text(data['cash'])}**"),
+            ephemeral=True
+        )
+
+
+class EconomyAdminView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("هذه اللوحة للإدارة فقط.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="إضافة رصيد", style=discord.ButtonStyle.success, emoji="➕")
+    async def give_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EconomyAmountModal("give"))
+
+    @discord.ui.button(label="تعديل رصيد", style=discord.ButtonStyle.primary, emoji="✏️")
+    async def set_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EconomyAmountModal("set"))
+
+    @discord.ui.button(label="تصفير الجميع", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def reset_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("تحتاج صلاحية administrator لتصفير الجميع.", ephemeral=True)
+        users = economy(interaction.guild.id)["users"]
+        for data in users.values():
+            data["cash"] = 0
+            data["bank"] = 0
+            data["shares"] = 0
+        save_data()
+        await interaction.response.send_message("تم تصفير أرصدة جميع الأعضاء المسجلين.", ephemeral=True)
 
 
 if __name__ == "__main__":
