@@ -1,3 +1,5 @@
+from font_data import ensure_font
+ensure_font()
 """رسم بطاقات البنك بتصميم زجاجي بنفسجي (Pillow).
 
 كل شيء يُرسم بدقة مضاعفة (SS) ثم يُصغَّر لحواف ناعمة.
